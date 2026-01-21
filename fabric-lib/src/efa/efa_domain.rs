@@ -6,6 +6,7 @@ use std::{
     rc::Rc,
     sync::Arc,
 };
+use std::ptr;
 
 use bytes::Bytes;
 use libfabric_sys::{
@@ -14,7 +15,7 @@ use libfabric_sys::{
     FI_OPT_SHARED_MEMORY_PERMITTED, FI_READ, FI_RECV, FI_REMOTE_READ, FI_REMOTE_WRITE,
     FI_SEND, FI_WRITE, fi_addr_t, fi_av_attr, fi_close, fi_cq_attr, fi_cq_data_entry,
     fi_cq_err_entry, fi_fabric, fi_mr_attr, fi_mr_dmabuf, fid_av, fid_cq, fid_domain,
-    fid_ep, fid_fabric, fid_mr, iovec,
+    fid_ep, fid_fabric, fid_mr, iovec, fi_msg_rma, fi_rma_iov
 };
 use tracing::{debug, error, warn};
 
@@ -35,6 +36,9 @@ use crate::{
     rdma_op::{GroupWriteOp, RecvOp, SendOp, WriteOp},
     utils::{defer::Defer, obj_pool::ObjectPool},
 };
+
+use cuda_lib::rt::{cudaGetDevice, cudaSetDevice};
+
 
 pub struct EfaDomain {
     info: EfaDomainInfo,
@@ -166,6 +170,7 @@ impl EfaDomain {
             // All data transfer should go through RDMA.
             let optval = false;
             let fi_setopt = (*(*ep.as_ptr()).ops).setopt.unwrap_unchecked();
+            /*
             let ret = fi_setopt(
                 ep_fid,
                 FI_OPT_ENDPOINT as i32,
@@ -173,6 +178,8 @@ impl EfaDomain {
                 &optval as *const _ as *mut c_void,
                 std::mem::size_of_val(&optval),
             );
+            */
+
             if ret != 0 {
                 return Err(LibfabricError::new(
                     ret,
@@ -299,11 +306,20 @@ impl EfaDomain {
             ..Default::default()
         };
         let mut flags = 0;
+
+        let mut original_cuda_device: i32 = 0;
+        cudaGetDevice(&mut original_cuda_device);
+
         match region.mapping() {
             Mapping::Host => {
                 mr_attr.__bindgen_anon_1.mr_iov = &iov;
             }
             Mapping::Device { device_id, dmabuf_fd: None } => {
+
+                if original_cuda_device != device_id.0 as i32 {
+                    cudaSetDevice(device_id.0 as i32);
+                }
+
                 mr_attr.iface = FI_HMEM_CUDA;
                 mr_attr.device.cuda = device_id.0 as i32;
                 mr_attr.__bindgen_anon_1.mr_iov = &iov;
@@ -326,7 +342,40 @@ impl EfaDomain {
 
         let mr = NonNull::new(mr)
             .ok_or_else(|| LibfabricError::new(ret, "fi_mr_regattr"))?;
+
+        
+        // pxz
+        let ret = unsafe {
+            let mr_fid = &raw mut (*mr.as_ptr()).fid;
+            let fi_mr_bind = (*(*mr_fid).ops).bind.unwrap_unchecked();
+            fi_mr_bind(
+                mr_fid,  // 这是 &mr->fid，类型是 *mut fid
+                &raw mut (*self.ep.as_ptr()).fid,  // 第二个参数是 *mut fid
+                0,  // 标志位
+                )
+        };
+        if ret != 0 {
+            return Err(LibfabricError::new(ret, "fi_mr_bind").into());
+        }
+
+        let ret = unsafe {
+            let mr_fid = &raw mut (*mr.as_ptr()).fid;
+            let fi_control = (*(*mr_fid).ops).control.unwrap_unchecked();
+            fi_control(
+                mr_fid,  // 这是 &mr->fid，类型是 *mut fid
+                FI_ENABLE as i32,  // 命令
+                null_mut(),  // 参数
+            )
+        };
+        if ret != 0 {
+            return Err(LibfabricError::new(ret, "fi_mr_enable").into());
+        }
+
+
         self.local_mr_map.insert(region.ptr(), mr);
+
+        cudaSetDevice(original_cuda_device); 
+
         Ok(MemoryRegionRemoteKey(unsafe { mr.as_ref() }.key))
     }
 
@@ -453,29 +502,163 @@ impl EfaDomain {
 
         let fi_writemsg =
             unsafe { (*(*context.ep.as_ptr()).rma).writemsg.unwrap_unchecked() };
+        
+        let fi_writedata =
+            unsafe { (*(*context.ep.as_ptr()).rma).writedata.unwrap_unchecked() };
+
+
         let mut cnt_submits = 0;
         loop {
             let (msg, flags) = context.rdma_op_iter.peek();
             if msg.is_null() {
                 break;
             }
+            
+            //pxz
+            let msg_ref = unsafe { &*(msg as *const fi_msg_rma) };
+            /*
+            println!("=== fi_msg_rma ===");
+            println!("msg_iov: {:p}", msg_ref.msg_iov);
+            println!("desc: {:p}", msg_ref.desc);
+            println!("iov_count: {}", msg_ref.iov_count);
+            println!("addr: {}", msg_ref.addr);
+            println!("rma_iov: {:p}", msg_ref.rma_iov);
+            println!("rma_iov_count: {}", msg_ref.rma_iov_count);
+            println!("context: {:p}", msg_ref.context);
+            println!("data: {}", msg_ref.data);
 
-            let ret = unsafe { fi_writemsg(context.ep.as_ptr(), msg, flags) };
-            match ret {
-                0 => {
-                    context.rdma_op_iter.advance();
-                    context.cnt_posted_ops += 1;
-                    cnt_submits += 1;
-                    if cnt_submits >= max_submit {
+            println!("=== iov ===");
+            let iov_ptr = unsafe { msg_ref.msg_iov.offset(0) };
+            let iov = unsafe { &*iov_ptr };
+            println!(" iov_base: {:p}, iov_len: {}",  iov.iov_base, iov.iov_len);
+            */
+
+            //println!("=== rma_iov ===");
+            //let rma_iov_ptr = unsafe { msg_ref.rma_iov.offset(0) };
+            //let rma_iov = unsafe { &*rma_iov_ptr };
+            //println!("rma_iov.addr=0x{:x}, len={}, key={}", rma_iov.addr, rma_iov.len, rma_iov.key);
+
+            if flags != 0 {
+
+                unsafe {
+                    let msg_ref = msg as *const libfabric_sys::fi_msg_rma;
+                    let msg_data = &*msg_ref;
+                    /*
+                    if msg_data.iov_count != 1 || msg_data.rma_iov_count != 1 {
+                        panic!("Unsupported: iov_count = {}, rma_iov_count = {}",
+                           msg_data.iov_count, msg_data.rma_iov_count);
+                    }
+                    */
+                    let desc = if !msg_data.desc.is_null() {
+                        *msg_data.desc
+                    } else {
+                        std::ptr::null_mut()
+                    };
+                    let data = msg_data.data;
+                    let dest_addr = msg_data.addr;
+                    let rma_iov = &*msg_data.rma_iov;
+                    let remote_addr = rma_iov.addr as u64;
+                    let key = rma_iov.key as u64;
+                    let context_ptr = msg_data.context as *mut std::ffi::c_void;
+
+                    if msg_data.iov_count == 0 {
+                        let buf = ptr::null();
+                        let len = 0;
+                        
+                        let ret = fi_writedata(
+                            context.ep.as_ptr(),
+                            buf,
+                            len,
+                            desc,
+                            data,
+                            dest_addr,
+                            remote_addr,
+                            key,
+                            context_ptr
+                        );
+                        match ret {
+                            0 => {
+                                context.rdma_op_iter.advance();
+                                context.cnt_posted_ops += 1;
+                                cnt_submits += 1;
+                                if cnt_submits >= max_submit {
+                                    break;
+                                }
+                            }
+                            EAGAIN => {
+                                // Busy. Break and try again later.
+                                break;
+                            }
+                            _ => panic!("fi_writedata returned undocumented error: {}", ret),
+                        }
+
+                    }else {
+                        if msg_data.iov_count != 1 {
+                            panic!("Unsupported! iov_count={}", msg_data.iov_count);
+                        }
+                        let iov = &*msg_data.msg_iov;
+                        let buf = iov.iov_base as *mut std::ffi::c_void;
+                        let len = iov.iov_len as usize;
+
+                        let ret = fi_writedata(
+                            context.ep.as_ptr(),
+                            buf,
+                            len,
+                            desc,
+                            data,
+                            dest_addr,
+                            remote_addr,
+                            key,
+                            context_ptr
+                        );
+                        match ret {
+                            0 => {
+                                context.rdma_op_iter.advance();
+                                context.cnt_posted_ops += 1;
+                                cnt_submits += 1;
+                                if cnt_submits >= max_submit {
+                                    break;
+                                }
+                            }
+                            EAGAIN => {
+                                // Busy. Break and try again later.
+                                break;
+                            }
+                            _ => panic!("fi_writedata returned undocumented error: {}", ret),
+                        }
+                    }
+
+                }
+
+            }else{
+
+                /*
+                let msg_ref = unsafe { &mut *(msg as *mut fi_msg_rma) };
+                let rma_iov_ptr = unsafe { msg_ref.rma_iov.offset(0) as *mut fi_rma_iov };
+                let rma_iov = unsafe { &mut *rma_iov_ptr };
+                rma_iov.addr = 0;
+                */
+
+                let ret = unsafe { fi_writemsg(context.ep.as_ptr(), msg, flags) };
+                match ret {
+                    0 => {
+                        context.rdma_op_iter.advance();
+                        context.cnt_posted_ops += 1;
+                        cnt_submits += 1;
+                        if cnt_submits >= max_submit {
+                            break;
+                        }
+                    }
+                    EAGAIN => {
+                        // Busy. Break and try again later.
                         break;
                     }
+                    _ => panic!("fi_writemsg returned undocumented error: {}", ret),
                 }
-                EAGAIN => {
-                    // Busy. Break and try again later.
-                    break;
-                }
-                _ => panic!("fi_writemsg returned undocumented error: {}", ret),
+            
             }
+
+
         }
     }
 

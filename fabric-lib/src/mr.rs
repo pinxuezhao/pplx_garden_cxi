@@ -30,7 +30,8 @@ impl MemoryRegion {
                     return Err(FabricLibError::Custom("not a device pointer"));
                 }
                 let dmabuf_fd = if linux_kernel_supports_dma_buf() {
-                    cu_get_dma_buf_fd(ptr, len).ok()
+       //             cu_get_dma_buf_fd(ptr, len).ok()
+                    None
                 } else {
                     None
                 };

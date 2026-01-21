@@ -171,7 +171,9 @@ impl WorkerState {
         let combine_barrier_counter =
             transfer_engine.get_imm_counter(combine_barrier_imm);
 
+
         // Prepare the re-usable command to send out routing info.
+        
         let route_write_op = {
             // Send the expert counts, plus one, over to all peers.
             let mut dsts = Vec::with_capacity(world_size - 1);
@@ -184,9 +186,15 @@ impl WorkerState {
                     continue;
                 }
 
+
                 let dst_mr = rank_handles[peer_rank].num_routed_desc.clone();
                 let length: u64 = (num_experts * std::mem::size_of::<u32>()) as u64;
                 let offset: u64 = (dp_group as u64) * length;
+                //let length: u64 = 1 as u64;
+                //let offset: u64 = (dp_group as u64) * length;
+
+                //println!("route_write_op: rank={:?}, peer_rank={:?}, peer_group={:?}, dp_size={:?}, dp_rank={:?}, dp_group={:?}, dst_mr={:?}, length={:?}, offset={:?}", rank, peer_rank, peer_group, dp_size, dp_rank, dp_group, dst_mr, length, offset);
+
                 addrs.push(extract_addrs(&dst_mr));
                 dsts.push(ScatterTarget {
                     length,
@@ -207,6 +215,7 @@ impl WorkerState {
                 domain: GroupTransferRouting::AllDomainsShardPeers,
             })
         };
+
 
         let (dispatch_barrier_write_op, combine_barrier_write_op) = {
             // Send an immedate to all peer ranks.
@@ -230,6 +239,7 @@ impl WorkerState {
             });
             (dispatch, combine)
         };
+
 
         Ok(WorkerState {
             transfer_engine: transfer_engine.clone(),
@@ -306,6 +316,7 @@ impl WorkerState {
     fn get_num_routed(&self, dp_group: usize, expert: usize) -> u32 {
         assert!(dp_group < self.world_size / self.dp_size);
         assert!(expert < self.num_experts);
+
         unsafe {
             AtomicU32::from_ptr(
                 self.buffers.num_routed_ptr.add(dp_group * self.num_experts + expert),
@@ -322,6 +333,58 @@ impl WorkerState {
 
     fn get_combine_token_dim(&self) -> usize {
         (self.hidden_dim * self.out_elemsize).div_ceil(16) * 16
+    }
+
+    fn debug_num_routed(&self, flag: usize) {
+        let value_0 = unsafe{
+            AtomicU32::from_ptr(self.buffers.num_routed_ptr.add(0)).load(Ordering::Relaxed)
+        };
+        let value_1 = unsafe{
+            AtomicU32::from_ptr(self.buffers.num_routed_ptr.add(1)).load(Ordering::Relaxed)
+        };
+        let value_2 = unsafe{
+            AtomicU32::from_ptr(self.buffers.num_routed_ptr.add(2)).load(Ordering::Relaxed)
+        };
+        let value_3 = unsafe{
+            AtomicU32::from_ptr(self.buffers.num_routed_ptr.add(3)).load(Ordering::Relaxed)
+        };
+        let value_4 = unsafe{
+            AtomicU32::from_ptr(self.buffers.num_routed_ptr.add(4)).load(Ordering::Relaxed)
+        };
+        let value_5 = unsafe{
+            AtomicU32::from_ptr(self.buffers.num_routed_ptr.add(5)).load(Ordering::Relaxed)
+        };
+        let value_6 = unsafe{
+            AtomicU32::from_ptr(self.buffers.num_routed_ptr.add(6)).load(Ordering::Relaxed)
+        };
+        let value_7 = unsafe{
+            AtomicU32::from_ptr(self.buffers.num_routed_ptr.add(7)).load(Ordering::Relaxed)
+        };
+        let value_8 = unsafe{
+            AtomicU32::from_ptr(self.buffers.num_routed_ptr.add(8)).load(Ordering::Relaxed)
+        };
+        let value_9 = unsafe{
+            AtomicU32::from_ptr(self.buffers.num_routed_ptr.add(9)).load(Ordering::Relaxed)
+        };
+        let value_10 = unsafe{
+            AtomicU32::from_ptr(self.buffers.num_routed_ptr.add(10)).load(Ordering::Relaxed)
+        };
+        let value_11 = unsafe{
+            AtomicU32::from_ptr(self.buffers.num_routed_ptr.add(11)).load(Ordering::Relaxed)
+        };
+        let value_12 = unsafe{
+            AtomicU32::from_ptr(self.buffers.num_routed_ptr.add(12)).load(Ordering::Relaxed)
+        };
+        let value_13 = unsafe{
+            AtomicU32::from_ptr(self.buffers.num_routed_ptr.add(13)).load(Ordering::Relaxed)
+        };
+        let value_14 = unsafe{
+            AtomicU32::from_ptr(self.buffers.num_routed_ptr.add(14)).load(Ordering::Relaxed)
+        };
+        let value_15 = unsafe{
+            AtomicU32::from_ptr(self.buffers.num_routed_ptr.add(15)).load(Ordering::Relaxed)
+        };
+        //println!("debug write_op, flag={:?}, rank={:?}, num_routed = {:?}, {:?}, {:?}, {:?}; {:?}, {:?}, {:?}, {:?}; {:?}, {:?}, {:?}, {:?}; {:?}, {:?}, {:?}, {:?}", flag, self.rank, value_0, value_1, value_2, value_3, value_4, value_5, value_6, value_7, value_8, value_9, value_10, value_11,value_12, value_13, value_14, value_15);
     }
 
     pub fn main_loop(&self) {
@@ -344,6 +407,9 @@ impl WorkerState {
             return;
         }
 
+        // pxz before exchanging routing info
+//        self.debug_num_routed(0);
+
         // Start exchanging routing info.
         self.transfer_engine
             .submit_transfer_atomic(
@@ -352,7 +418,6 @@ impl WorkerState {
                 self.err_counter.clone(),
             )
             .unwrap();
-
         // Wait for the dispatch kernel to copy tokens into send buffers.
         self.dispatch_send_done.wait();
         self.tx_ready.set(false);
@@ -360,13 +425,20 @@ impl WorkerState {
             return;
         }
 
+
+//        self.debug_num_routed(1);
+
         // Trigger transfers into private recv buffers.
         let num_private_ranges = self.dispatch_initial_routes();
 
         // Wait for the routing information to arrive and aggregate it.
         let num_dp_groups = (self.world_size / self.dp_size) as u32;
         self.route_counter.wait(num_dp_groups - 1);
+
+
         let route = self.process_routing_info();
+
+//        self.debug_num_routed(2);
 
         // Register a callback to wait for the expected number of immediates.
         let num_shards = self.transfer_engine.nets_per_gpu().get() as u32;
@@ -537,6 +609,8 @@ impl WorkerState {
         let groups_per_node = self.node_size / self.dp_size;
         let num_nodes = self.world_size / self.node_size;
 
+//        println!("worker, rank={:?}, num_dp_groups={:?}, experts_per_rank={:?}, first_local_expert={:?}, last_local_expert={:?}, num_local_experts={:?}, rank_node={:?}, groups_per_node={:?}, num_nodes={:?}", self.rank, num_dp_groups, experts_per_rank, first_local_expert, last_local_expert, num_local_experts, rank_node, groups_per_node, num_nodes);
+
         // On the sender side, find the start offset of each expert.
         let nets_per_gpu = self.transfer_engine.nets_per_gpu().get() as u32;
         let mut tokens_from_group = vec![0; num_dp_groups];
@@ -582,6 +656,7 @@ impl WorkerState {
                 tokens_from_group[dp_group] += num_tokens as u32;
                 src_group_offset[dp_group] = num_recv_tokens as u32;
                 num_recv_tokens += num_tokens;
+                //println!("rank={:?}, dp_group={:?}, num_tokens={:?}, num_recv_tokens={:?}, first_local_expert={:?}, last_local_expert={:?}", self.rank, dp_group, num_tokens, num_recv_tokens, first_local_expert, last_local_expert);
 
                 if dp_group != self.dp_group && group_node != rank_node {
                     // Private buffer scatter shards by Peers.
@@ -692,6 +767,8 @@ impl WorkerState {
             );
         }
         route_group(self.dp_group);
+
+        //println!("worker: rank={:?}, num_recv_tokens={:?}, num_recv_efa_tokens={:?}", self.rank, num_recv_tokens, num_recv_efa_tokens);
 
         // Copy the buffers to the device.
         self.padded_index.copy(&padded_index);

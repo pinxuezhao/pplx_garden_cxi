@@ -7,7 +7,7 @@ use std::{
 use libfabric_sys::{
     FI_ENOMEM, FI_EP_RDM, FI_HMEM, FI_LOCAL_COMM, FI_MR_ALLOCATED, FI_MR_HMEM,
     FI_MR_LOCAL, FI_MR_PROV_KEY, FI_MR_VIRT_ADDR, FI_MSG, FI_REMOTE_COMM, FI_RMA,
-    FI_THREAD_DOMAIN, fi_dupinfo, fi_freeinfo, fi_getinfo, fi_info, make_fi_version,
+    FI_THREAD_DOMAIN, fi_dupinfo, fi_freeinfo, fi_getinfo, fi_info, make_fi_version, FI_MR_ENDPOINT
 };
 
 use crate::{
@@ -15,6 +15,7 @@ use crate::{
     provider::RdmaDomainInfo,
 };
 
+#[derive(Debug)]
 pub struct EfaDomainInfo {
     pub fi: NonNull<fi_info>,
 }
@@ -68,12 +69,19 @@ pub fn get_efa_domains() -> Result<Vec<EfaDomainInfo>> {
         h.caps =
             FI_MSG as u64 | FI_RMA as u64 | FI_HMEM | FI_LOCAL_COMM | FI_REMOTE_COMM;
         (*h.ep_attr).type_ = FI_EP_RDM;
-        (*h.fabric_attr).prov_name = c"efa".as_ptr() as *mut libc::c_char;
+        (*h.fabric_attr).prov_name = c"cxi".as_ptr() as *mut libc::c_char;
+        /*
         (*h.domain_attr).mr_mode = (FI_MR_LOCAL
             | FI_MR_HMEM
             | FI_MR_VIRT_ADDR
             | FI_MR_ALLOCATED
             | FI_MR_PROV_KEY) as i32;
+        */
+
+        (*h.domain_attr).mr_mode = (FI_MR_ENDPOINT  
+            | FI_MR_ALLOCATED
+            | FI_MR_PROV_KEY) as i32;
+
         (*h.domain_attr).threading = FI_THREAD_DOMAIN;
 
         let mut info = null_mut();

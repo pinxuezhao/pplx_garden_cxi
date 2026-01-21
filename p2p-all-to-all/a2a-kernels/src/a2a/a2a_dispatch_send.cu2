@@ -1,0 +1,1204 @@
+#include "a2a/a2a_kernels.h"
+#include "core/device_utils.cuh"
+#include "core/launch_utils.cuh"
+#include "core/memory.cuh"
+
+#include <cuda.h>
+#include <cooperative_groups.h>
+#include <nvtx3/nvToolsExt.h>
+
+#include <cassert>
+#include <cstdint>
+
+#include <cuda_fp16.h>
+
+using namespace rose;
+using namespace rose::device;
+
+struct ExpertAndOffset {
+    uint32_t expert;
+    uint32_t offset;
+    uint32_t position;
+    float weight;
+};
+
+
+/// Wrapper class to efficiently access the expert indices and offsets.
+template<typename NumExpertsPerTokenTy>
+class ExpertIterator {
+public:
+    __forceinline__ __device__ ExpertIterator(
+        NumExpertsPerTokenTy num_experts_per_token,
+        const int32_t *indices,
+        const size_t indices_stride,
+        const float *weights,
+        const size_t weights_stride,
+        const uint32_t *token_offset,
+        const uint32_t *expert_offsets,
+        unsigned token,
+        unsigned experts_per_rank
+    ) : num_experts_per_token_(num_experts_per_token),
+        indices_(indices),
+        indices_stride_(indices_stride),
+        weights_(weights),
+        weights_stride_(weights_stride),
+        token_offset_(token_offset),
+        expert_offsets_(expert_offsets),
+        token_(token),
+        experts_per_rank(experts_per_rank)
+    {
+    }
+
+    __forceinline__ __device__ ExpertAndOffset operator[](unsigned i) {
+        const uint32_t expert = indices_[token_ * indices_stride_ + i];
+        const float weight = weights_[token_ * weights_stride_ + i];
+        const uint32_t offset = token_offset_[token_ * num_experts_per_token_ + i];
+        const uint32_t position = (expert > 0 ? expert_offsets_[expert - 1] : 0) + offset;
+        const uint32_t dst_rank = expert / experts_per_rank;
+        const uint32_t rank_offset = dst_rank > 0 ? expert_offsets_[dst_rank * experts_per_rank - 1] : 0;
+        return {expert, position - rank_offset, position, weight};
+    }
+
+private:
+    NumExpertsPerTokenTy num_experts_per_token_;
+    const int32_t *indices_;
+    const size_t indices_stride_;
+    const float *weights_;
+    const size_t weights_stride_;
+    const uint32_t *token_offset_;
+    const uint32_t *expert_offsets_;
+    unsigned token_;
+    unsigned experts_per_rank;
+};
+
+template <size_t N>
+class ExpertIterator<Fixed<N>> {
+public:
+    __forceinline__ __device__ ExpertIterator(
+        Fixed<N> num_experts_per_token,
+        const int32_t *indices,
+        const size_t indices_stride,
+        const float *weights,
+        const size_t weights_stride,
+        const uint32_t *token_offset,
+        const uint32_t *expert_offsets,
+        unsigned token,
+        unsigned experts_per_rank
+    ) {
+        #pragma unroll(N)
+        for (unsigned i = 0; i < N; i++) {
+            const auto expert = indices[token * indices_stride + i];
+            const auto weight = weights[token * weights_stride + i];
+            const auto offset = token_offset[token * N + i];
+            const uint32_t position = (expert > 0 ? expert_offsets[expert - 1] : 0) + offset;
+            const uint32_t dst_rank = expert / experts_per_rank;
+            const uint32_t rank_offset = dst_rank > 0 ? expert_offsets[dst_rank * experts_per_rank - 1] : 0;
+            experts_[i] = expert;
+            weights_[i] = weight;
+            offsets_[i] = position - rank_offset;
+            positions_[i] = position;
+        }
+    }
+
+    __forceinline__ __device__ ExpertAndOffset operator[](unsigned i) {
+        return {experts_[i], offsets_[i], positions_[i], weights_[i]};
+    }
+
+private:
+    uint32_t experts_[N];
+    float weights_[N];
+    uint32_t offsets_[N];
+    uint32_t positions_[N];
+};
+
+__global__ void sync_kernel(
+    int rank,
+    int node_size, 
+    uint32_t** sync_ptrs,
+    uint32_t counter
+){
+    if(blockIdx.x == 0 && threadIdx.x == 0){
+        auto local_rank = rank % node_size;
+        uint32_t* my_sync_buffer = (uint32_t*)sync_ptrs[local_rank];
+        for(int peer=0; peer<node_size; peer++){
+            if (peer==local_rank) continue;
+            st_release_u32(&my_sync_buffer[peer], counter);
+        }
+
+        __threadfence_system();
+
+        for(int peer=0; peer<node_size; peer++){
+            if(peer==local_rank) continue;
+            uint32_t* peer_sync_buffer = (uint32_t*)sync_ptrs[peer];
+            uint32_t* flag = &peer_sync_buffer[local_rank];
+            while (ld_volatile_u32(flag)!=counter){
+
+            }
+        }
+
+        /*
+        __threadfence_system();
+
+        for (int peer=0; peer<node_size; peer++){
+            if(peer == local_rank) continue;
+            st_release_u32(&my_sync_buffer[peer], 0);
+        }
+
+        __threadfence_system();
+
+        for (int peer=0; peer<node_size; peer++){
+            if (peer==local_rank) continue;
+            uint32_t* peer_sync_buffer = (uint32_t*)sync_ptrs[peer];
+            uint32_t* flag = &peer_sync_buffer[local_rank];
+            while(ld_volatile_u32(flag)!=0){}
+        }
+
+        __threadfence_system();
+        */
+
+    }
+}
+
+__global__ void debug_kernel(
+    int rank,
+    int node_size, 
+    uint8_t** recv_ptrs
+){
+    if(threadIdx.x==0 && blockIdx.x==0){
+        for(int target_rank=0; target_rank<node_size; target_rank++){
+            uint8_t* target_buffer = recv_ptrs[target_rank];
+            __nv_bfloat16* bf16_ptr = (__nv_bfloat16*)(target_buffer+rank*sizeof(__nv_bfloat16));
+            float value = static_cast<float>(rank+10);
+            __nv_bfloat16 bf16_value = __float2bfloat16_rn(value);
+            *bf16_ptr = bf16_value;
+            //printf("GPU%d, write value=%.1f to GPU%d\n", rank, value, target_rank);
+        }
+    }
+}
+
+__global__ void debug_print_kernel(
+    int rank, 
+    uint8_t** recv_ptrs
+){
+    if(threadIdx.x==0 && blockIdx.x==0){
+        __nv_bfloat16* bfloat16_ptr = (__nv_bfloat16*)(recv_ptrs[rank]);
+        float float_val_0 = __bfloat162float(bfloat16_ptr[0]);
+        float float_val_1 = __bfloat162float(bfloat16_ptr[1]);
+        float float_val_2 = __bfloat162float(bfloat16_ptr[2]);
+        float float_val_3 = __bfloat162float(bfloat16_ptr[3]);
+        printf("GPU%d, recv_ptrs[%d]=%f, %f, %f, %f\n", rank, rank, float_val_0, float_val_1, float_val_2, float_val_3);
+    }
+}
+
+__global__ void clear_kernel(
+    int rank,
+    uint8_t** recv_ptrs
+){
+    if(threadIdx.x==0 && blockIdx.x==0){
+        __nv_bfloat16* bfloat16_ptr = (__nv_bfloat16*)(recv_ptrs[rank]);
+        bfloat16_ptr[0] = 0.0;
+        bfloat16_ptr[1] = 0.0;
+        bfloat16_ptr[2] = 0.0;
+        bfloat16_ptr[3] = 0.0;
+    }
+}
+
+
+template<bool QUICK, size_t NUM_WARPS, size_t NODE_SIZE, typename TokenDimTy, typename HiddenDimScaleTy, typename NumExpertsPerTokenTy>
+__global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_kernel(
+    const size_t token_dim,
+    const size_t token_scale_dim,
+    const size_t token_stride,
+    size_t hidden_dim,
+    size_t hidden_dim_scale,
+    size_t num_experts,
+    size_t num_experts_per_token,
+    size_t max_private_tokens,
+    size_t rank,
+    size_t dp_size,
+    size_t node_size,
+    size_t world_size,
+    size_t num_tokens,
+    const int32_t * __restrict__ bound_m_ptr,
+    const std::byte * __restrict__ x_ptr,
+    size_t x_elemsize,
+    size_t x_stride,
+    const float * __restrict__ x_scale_ptr,
+    size_t x_scale_elemsize,
+    size_t x_scale_stride_elem,
+    size_t x_scale_stride_token,
+    const int32_t * __restrict__ indices,
+    size_t indices_stride,
+    const float *__restrict__ weights,
+    size_t weights_stride,
+    uint32_t * __restrict__ token_offset,
+    uint32_t * __restrict__ num_routed,
+    uint32_t * __restrict__ expert_offsets,
+    uint8_t * __restrict__ dispatch_route_done,
+    uint8_t * __restrict__ dispatch_send_done,
+    uint8_t * __restrict__ tx_ready,
+    std::byte * __restrict__ send_buffer,
+    uint32_t * __restrict__ grid_counter,
+    uint32_t * __restrict__ sync_counter,
+    uint32_t ** __restrict__ sync_ptrs,
+    std::byte ** __restrict__ recv_ptrs
+) {
+
+    /*
+    if(threadIdx.x == 0 && blockIdx.x == 0){
+        printf("INSIDE KERNEL: token_dim=%lu, token_scale_dim=%lu, token_stride=%lu, hidden_dim=%lu, hidden_dim_scale=%lu, num_experts=%lu, num_experts_per_token=%lu, max_private_tokens=%lu,  rank=%lu, dp_size=%lu, node_size=%lu, world_size=%lu, num_tokens=%lu, x_elemsize=%lu, x_stride=%lu, x_scale_elemsize=%lu, x_scale_stride_elem=%lu, x_scale_stride_token=%lu, indices_stride=%lu\n", token_dim, token_scale_dim, token_stride, hidden_dim, hidden_dim_scale, num_experts, num_experts_per_token, max_private_tokens, rank, dp_size, node_size, world_size, num_tokens, x_elemsize, x_stride, x_scale_elemsize, x_scale_stride_elem, x_scale_stride_token, indices_stride);
+    }*/
+
+    TokenDimTy token_dim_bound(token_dim);
+    HiddenDimScaleTy hidden_dim_scale_bound(hidden_dim_scale);
+    NumExpertsPerTokenTy num_experts_per_token_bound(num_experts_per_token);
+
+    auto grid = cooperative_groups::this_grid();
+    auto block = cooperative_groups::this_thread_block();
+
+    extern __shared__ std::byte shared_memory[];
+    constexpr size_t NUM_THREADS = NUM_WARPS * WARP_SIZE;
+    const size_t warp_id = threadIdx.x / WARP_SIZE;
+    const size_t lane_id = get_lane_id();
+
+    uint32_t counter = *sync_counter;
+
+    const size_t node_rank = rank / NODE_SIZE;
+    const size_t node_group = rank / dp_size;
+    const size_t dp_group = rank / dp_size;
+    const size_t experts_per_rank = ceil_div<size_t>(num_experts, world_size);
+    const size_t first_expert = rank * experts_per_rank;
+    const size_t last_expert = min<size_t>(first_expert + experts_per_rank, num_experts);
+
+    const size_t num_send_tokens = bound_m_ptr ? *bound_m_ptr : num_tokens;
+
+    /*
+    if (threadIdx.x==0 && blockIdx.x==0){
+        printf("rank=%lu, node_rank=%lu, node_group=%lu, dp_group=%lu, experts_per_rank=%lu, first_expert=%lu, last_expert=%lu, num_send_tokens=%lu\n", rank, node_rank, node_group, dp_group, experts_per_rank, first_expert, last_expert, num_send_tokens);
+    }*/
+
+    // In the first phase, count how many tokens are sent to each other rank
+    // and assign a unique offset to each token within the ranks.
+    if (blockIdx.x == 0) {
+        uint32_t *tokens_per_expert = (uint32_t*)shared_memory;
+        for (uint32_t i = threadIdx.x; i <num_experts; i += blockDim.x) {
+            tokens_per_expert[i] = 0;
+        }
+        __syncthreads();
+
+        for (uint32_t i = threadIdx.x; i < num_send_tokens * num_experts_per_token_bound; i += blockDim.x) {
+            const uint32_t token = i / num_experts_per_token_bound;
+            const uint32_t index = i % num_experts_per_token_bound;
+            const uint32_t expert = __ldg(&indices[token * indices_stride + index]);
+
+            // Assign an offset to the token within the current rank and expert.
+            token_offset[i] = atomicAdd(&tokens_per_expert[expert], 1);
+        }
+        __syncthreads();
+
+        /*
+         if (threadIdx.x == 0){
+            printf("tokens_per_expert rank=%lu, %u, %u, %u, %u\n", rank, tokens_per_expert[0], tokens_per_expert[1], tokens_per_expert[2], tokens_per_expert[3]);
+        }*/
+
+        // Find the start offset of each rank by computing a cumulative sum within tokens_per_rank.
+        // Compute sums within each warp and store the sums in shared memory.
+        const uint32_t i = threadIdx.x;
+        const uint32_t num_warps = ceil_div<size_t>(num_experts, WARP_SIZE);
+        uint32_t *expert_sums = (uint32_t*)shared_memory;
+
+        uint32_t *local_num_routed = num_routed + dp_group * num_experts;
+        uint32_t expert_offset = 0;
+        if (i < num_experts) {
+            expert_offset = tokens_per_expert[i];
+            local_num_routed[i] = expert_offset;
+        }
+        __syncthreads();
+
+        /*
+        if (threadIdx.x == 0){
+            printf("rank=%lu, DISPATCH SEND, num_routed: %u, %u, %u, %u; %u, %u, %u, %u; %u, %u, %u, %u; %u, %u, %u, %u\n", rank, num_routed[0], num_routed[1], num_routed[2], num_routed[3], num_routed[4], num_routed[5], num_routed[6], num_routed[7], num_routed[8], num_routed[9], num_routed[10], num_routed[11], num_routed[12], num_routed[13], num_routed[14], num_routed[15]);
+        }
+        */
+
+        if (threadIdx.x == 0) {
+            st_mmio_b8(dispatch_route_done, 1);
+        }
+        for (int offset = 1; offset < WARP_SIZE; offset <<= 1) {
+            unsigned warp_sum_expert = __shfl_up_sync(0xFFFFFFFF, expert_offset, offset);
+            if (lane_id >= offset) {
+                expert_offset += warp_sum_expert;
+            }
+        }
+        if (lane_id == WARP_SIZE - 1) {
+            expert_sums[warp_id] = expert_offset;
+        }
+        __syncthreads();
+
+        // Sum up the warp sums in the first warp.
+        if (warp_id == 0) {
+            uint32_t total_expert_sum = (lane_id < num_warps) ? expert_sums[lane_id] : 0;
+            for (int offset = 1; offset < num_warps; offset <<= 1) {
+                unsigned warp_sum = __shfl_up_sync(0xFFFFFFFF, total_expert_sum, offset);
+                if (lane_id >= offset) {
+                    total_expert_sum += warp_sum;
+                }
+            }
+            if (lane_id < num_warps) {
+                expert_sums[lane_id] = total_expert_sum;
+            }
+        }
+        __syncthreads();
+
+        // Add the sums to the token counts to find the start offset of each expert.
+        if (i < num_experts) {
+            if (warp_id > 0) {
+                expert_offsets[i] = expert_sums[warp_id - 1] + expert_offset;
+            } else {
+                expert_offsets[i] = expert_offset;
+            }
+        }
+    }
+    __syncthreads();
+
+    // NVLink barrier set on the end of combine.
+    if (NODE_SIZE > 1) {
+        if (blockIdx.x == 0) {
+            auto local_rank = rank % NODE_SIZE;
+            for (unsigned peer = threadIdx.x; peer < NODE_SIZE; peer += blockDim.x) {
+                while (ld_volatile_u32(&sync_ptrs[local_rank][peer]) != counter);
+            }
+        }
+    }
+
+    // Wait for all transactions using the send buffer to finish before writing to it.
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        while (ld_mmio_b8(tx_ready) == 0);
+    }
+
+    grid.sync();
+    /*
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        *sync_counter = counter + 1;
+    }
+
+    if (blockIdx.x==0 && threadIdx.x==0){
+        printf("expert_offsets, rank=%lu, %u, %u, %u, %u\n", rank, expert_offsets[0], expert_offsets[1], expert_offsets[2], expert_offsets[3]);
+        printf("rank=%lu, indices_stride=%lu, weights_stride=%lu\n", rank, indices_stride, weights_stride);
+        printf("token_offset, rank=%lu, %u, %u, %u, %u\n", rank, token_offset[0], token_offset[1], token_offset[2], token_offset[3]);
+    }
+    */
+
+    if constexpr (QUICK) {
+        unsigned token = blockIdx.x; // one block handles one token
+        if (token < num_send_tokens) {
+            uint4 *x_token_src = (uint4*)(x_ptr + token * x_stride); // byte* x_ptr, x_stride=16, 16bytes
+            float *x_scale_src = (float*)(x_scale_ptr + token * x_scale_stride_token); // float* x_scale_ptr, x_scale_stride_token=4, 16bytes
+
+            ExpertIterator<NumExpertsPerTokenTy> expert_iterator(
+                num_experts_per_token_bound,
+                indices,
+                indices_stride,
+                weights,
+                weights_stride,
+                token_offset,
+                expert_offsets,
+                token,
+                experts_per_rank
+            );
+
+            float* x_token_src_float = (float*)(x_ptr + token*x_stride);
+
+            if constexpr (std::is_same_v<TokenDimTy, NotFixed>) {
+                // Here!!
+                // Copy to shared memory and sync up threads.
+                for (unsigned i = threadIdx.x; i * sizeof(uint4) < token_dim_bound; i += NUM_THREADS) {
+                    const bool has_scale = x_scale_ptr && i < hidden_dim_scale_bound;
+
+                    uint4 val = ld_global_nc_uint4(&x_token_src[i]);
+
+                    float val_float = x_token_src_float[i];
+//                    printf("rank=%lu, blockIdx.x=%u, threadIdx.x=%u, val_float=%f, sizeof(uint4)=%lu \n",rank, blockIdx.x, threadIdx.x, val_float, sizeof(uint4));
+
+                    /* pxz
+                    float scale_val;
+                    if (has_scale) {
+                        scale_val =  *(float*)(x_scale_src + i * x_scale_stride_elem);
+                    }
+                    */
+
+                    // Copy from shared memory to the send buffer, ensuring a contiguous layout per rank.
+                    //#pragma unroll
+                    // PXZ DEBUG HERE!
+                    for (unsigned e = 0; e < num_experts_per_token_bound; e++) {
+                        auto route = expert_iterator[e];
+                        const uint32_t dst_rank = route.expert / experts_per_rank;
+                        const uint32_t dst_node = dst_rank / NODE_SIZE;
+
+                        // If the destination is within the same node, write using NVLink.
+                        if (dst_node == node_rank && dst_rank != rank && route.offset < max_private_tokens) {
+
+                            if (dst_rank % dp_size == rank % dp_size) {
+
+
+                                // Write to the private recv buffer directly using NVLink.
+                                const uint32_t local_peer = dst_rank % NODE_SIZE;
+                                std::byte *token_ptr = recv_ptrs[local_peer] + (node_group * max_private_tokens + route.offset) * token_stride;
+
+                                printf("rank=%lu, blockIdx.x=%u, threadIdx.x=%u, local_peer=%u, node_group=%lu, max_private_tokens=%lu, route.offset=%u, token_stride=%lu, route.position=%u\n", rank, blockIdx.x, threadIdx.x, local_peer, node_group, max_private_tokens, route.offset, token_stride, route.position);
+
+                                uint4 *x_token_dst = (uint4*)token_ptr;
+
+                                st_global_nc_uint4(&x_token_dst[i], val);
+                                /*pxz
+                                if (has_scale) {
+                                    *((float*)(token_ptr + token_dim_bound) + i) = scale_val;
+                                }
+                                */
+                            }
+                        } else {
+
+                            printf("write_send_buffer, rank=%lu, blockIdx.x=%u, threadIdx.x=%u, dst_rank=%u, node_group=%lu, max_private_tokens=%lu, route.offset=%u, token_stride=%lu, route.position=%u\n", rank, blockIdx.x, threadIdx.x, dst_rank, node_group, max_private_tokens, route.offset, token_stride, route.position);
+
+                            // Always write into the send buffer for local copies.
+                            std::byte *token_ptr = send_buffer + route.position * token_stride;
+                            uint4 *x_token_dst = (uint4*)token_ptr;
+                            st_global_nc_uint4(&x_token_dst[i], val);
+                            /*
+                            if (has_scale) {
+                                *((float*)(token_ptr + token_dim_bound) + i) = scale_val;
+                            }
+                            */
+                        }
+                    }
+                }
+
+                if (threadIdx.x == 0) {
+                    auto counter = add_release_gpu_u32(grid_counter, 1) + 1;
+                    if (counter == num_send_tokens) {
+                        st_mmio_b8(dispatch_send_done, 1);
+                        *grid_counter = 0;
+                    }
+                }
+            } else {
+                printf("SHOULD NOT BE HERE!\n");
+                return ;
+                constexpr size_t TOKEN_DIM = TokenDimTy::Value;
+                constexpr size_t NUM_STEPS = (TOKEN_DIM + NUM_THREADS - 1) / NUM_THREADS;
+
+                uint4 vals[NUM_STEPS];
+                float scales[NUM_STEPS];
+
+                #pragma unroll(NUM_STEPS)
+                for (unsigned i = threadIdx.x, s = 0; i * sizeof(uint4) < TOKEN_DIM; i += NUM_THREADS, s++) {
+                    const bool has_scale = x_scale_ptr && i < hidden_dim_scale_bound;
+                    vals[s] = ld_global_nc_uint4(&x_token_src[i]);
+                    if (has_scale) {
+                        scales[s] = *(float*)(x_scale_src + i * x_scale_stride_elem);
+                    }
+                }
+
+                // Copy from shared memory to the send buffer, ensuring a contiguous layout per rank.
+                #pragma unroll
+                for (unsigned e = 0; e < num_experts_per_token_bound; e++) {
+                    auto route = expert_iterator[e];
+                    const uint32_t dst_rank = route.expert / experts_per_rank;
+                    const uint32_t dst_node = dst_rank / NODE_SIZE;
+
+                    // If the destination is within the same node, write using NVLink.
+                    if (dst_node != node_rank || dst_rank == rank || route.offset >= max_private_tokens) {
+                        // Always write into the send buffer for local copies.
+                        std::byte *token_ptr = send_buffer + route.position * token_stride;
+                        uint4 *x_token_dst = (uint4*)token_ptr;
+                        for (unsigned i = threadIdx.x, s = 0; i * sizeof(uint4) < TOKEN_DIM; i += NUM_THREADS, s++) {
+                            const bool has_scale = x_scale_ptr && i < hidden_dim_scale_bound;
+                            st_global_nc_uint4(&x_token_dst[i], vals[s]);
+                            if (has_scale) {
+                                *((float*)(token_ptr + token_dim_bound) + i) = scales[s];
+                            }
+                        }
+                    }
+                }
+
+                __syncthreads();
+
+                if (threadIdx.x == 0) {
+                    auto counter = add_release_gpu_u32(grid_counter, 1) + 1;
+                    if (counter == num_send_tokens) {
+                        st_mmio_b8(dispatch_send_done, 1);
+                        *grid_counter = 0;
+                    }
+                }
+
+                grid.sync();
+
+                #pragma unroll
+                for (unsigned e = 0; e < num_experts_per_token_bound; e++) {
+                    auto route = expert_iterator[e];
+                    const uint32_t dst_rank = route.expert / experts_per_rank;
+                    const uint32_t dst_node = dst_rank / NODE_SIZE;
+
+                    // If the destination is within the same node, write using NVLink.
+                    if (dst_node == node_rank && dst_rank != rank && route.offset < max_private_tokens) {
+                        // Write to the private recv buffer directly using NVLink.
+                        const uint32_t local_peer = dst_rank % NODE_SIZE;
+                        std::byte *token_ptr = recv_ptrs[local_peer] + (node_group * max_private_tokens + route.offset) * token_stride;
+                        uint4 *x_token_dst = (uint4*)token_ptr;
+                        for (unsigned i = threadIdx.x, s = 0; i * sizeof(uint4) < TOKEN_DIM; i += NUM_THREADS, s++) {
+                            const bool has_scale = x_scale_ptr && i < hidden_dim_scale_bound;
+                            st_global_nc_uint4(&x_token_dst[i], vals[s]);
+                            if (has_scale) {
+                                *((float*)(token_ptr + token_dim_bound) + i) = scales[s];
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            if constexpr (!std::is_same_v<TokenDimTy, NotFixed>) {
+                grid.sync();
+            }
+        }
+    } else {
+
+        printf("SHOULD NOT BE HERE2!\n");
+        return;
+
+        // Copy the tokens to their corresponding position in the send buffer via shared memory.
+        unsigned num_local_tokens = 0;
+        for (unsigned token = blockIdx.x; token < num_send_tokens; token += gridDim.x, num_local_tokens++) {
+            uint4 *x_token_src = (uint4*)(x_ptr + token * x_stride);
+            float *x_scale_src = (float*)(x_scale_ptr + token * x_scale_stride_token);
+
+            ExpertIterator<NumExpertsPerTokenTy> expert_iterator(
+                num_experts_per_token_bound,
+                indices,
+                indices_stride,
+                weights,
+                weights_stride,
+                token_offset,
+                expert_offsets,
+                token,
+                experts_per_rank
+            );
+
+
+            // Copy to shared memory and sync up threads.
+            for (unsigned i = threadIdx.x; i * sizeof(uint4) < token_dim_bound; i += blockDim.x) {
+                const bool has_scale = x_scale_ptr && i < hidden_dim_scale_bound;
+
+                uint4 val = ld_global_nc_uint4(&x_token_src[i]);
+                float scale_val;
+                if (has_scale) {
+                    scale_val =  *(float*)(x_scale_src + i * x_scale_stride_elem);
+                }
+
+                // Copy from shared memory to the send buffer, ensuring a contiguous layout per rank.
+                #pragma unroll
+                for (unsigned e = 0; e < num_experts_per_token_bound; e++) {
+                    auto route = expert_iterator[e];
+                    const uint32_t dst_rank = route.expert / experts_per_rank;
+                    const uint32_t dst_node = dst_rank / NODE_SIZE;
+
+                    // If the destination is within the same node, write using NVLink.
+                    if (dst_node == node_rank && dst_rank != rank && route.offset < max_private_tokens) {
+                        continue;
+                    } else {
+                        // Always write into the send buffer for local copies.
+                        std::byte *token_ptr = send_buffer + route.position * token_stride;
+                        uint4 *x_token_dst = (uint4*)token_ptr;
+                        st_global_nc_uint4(&x_token_dst[i], val);
+                        if (has_scale) {
+                            *((float*)(token_ptr + token_dim_bound) + i) = scale_val;
+                        }
+                    }
+                }
+            }
+        }
+        __syncthreads();
+
+        if (threadIdx.x == 0) {
+            auto counter = add_release_gpu_u32(grid_counter, num_local_tokens) + num_local_tokens;
+            if (counter == num_send_tokens) {
+                st_mmio_b8(dispatch_send_done, 1);
+                *grid_counter = 0;
+            }
+        }
+
+        if (NODE_SIZE >= 1) {
+            for (unsigned token = blockIdx.x; token < num_send_tokens; token += gridDim.x) {
+                uint4 *x_token_src = (uint4*)(x_ptr + token * x_stride);
+                float *x_scale_src = (float*)(x_scale_ptr + token * x_scale_stride_token);
+
+                ExpertIterator<NumExpertsPerTokenTy> expert_iterator(
+                    num_experts_per_token_bound,
+                    indices,
+                    indices_stride,
+                    weights,
+                    weights_stride,
+                    token_offset,
+                    expert_offsets,
+                    token,
+                    experts_per_rank
+                );
+
+                // Copy to shared memory and sync up threads.
+                for (unsigned i = threadIdx.x; i * sizeof(uint4) < token_dim_bound; i += blockDim.x) {
+                    const bool has_scale = x_scale_ptr && i < hidden_dim_scale_bound;
+
+                    uint4 val = ld_global_nc_uint4(&x_token_src[i]);
+                    float scale_val;
+                    if (has_scale) {
+                        scale_val =  *(float*)(x_scale_src + i * x_scale_stride_elem);
+                    }
+
+                    // Copy from shared memory to the send buffer, ensuring a contiguous layout per rank.
+                    #pragma unroll
+                    for (unsigned e = 0; e < num_experts_per_token_bound; e++) {
+                        auto route = expert_iterator[e];
+                        const uint32_t dst_rank = route.expert / experts_per_rank;
+                        const uint32_t dst_node = dst_rank / NODE_SIZE;
+
+                        // If the destination is within the same node, write using NVLink.
+                        if (dst_node == node_rank && dst_rank != rank && route.offset < max_private_tokens) {
+                            if (dst_rank % dp_size == rank % dp_size) {
+                                // Write to the private recv buffer directly using NVLink.
+                                const uint32_t local_peer = dst_rank % NODE_SIZE;
+                                std::byte *token_ptr = recv_ptrs[local_peer] + (node_group * max_private_tokens + route.offset) * token_stride;
+                                uint4 *x_token_dst = (uint4*)token_ptr;
+                                st_global_nc_uint4(&x_token_dst[i], val);
+                                if (has_scale) {
+                                    *((float*)(token_ptr + token_dim_bound) + i) = scale_val;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (NODE_SIZE > 1) {
+        grid.sync();
+
+        if (blockIdx.x == 0) {
+            auto local_rank = rank % NODE_SIZE;
+            if (threadIdx.x < NODE_SIZE) {
+                auto *flag = &sync_ptrs[threadIdx.x][local_rank + NODE_SIZE];
+                st_release_u32(flag, counter + 1);
+            }
+        }
+    }
+}
+
+void print_x_ptr(float* cpu_x_ptr, int rank){
+    char output_str[1024];
+    int offset=0;
+    int written=0;
+    written = snprintf(output_str+offset, sizeof(output_str)-offset, "x_ptr, rank=%d: ", rank);
+    offset += written;
+
+    for(int i=0; i<16; i++){
+        written = snprintf(output_str+offset, sizeof(output_str)-offset, "%f, ", cpu_x_ptr[i]);
+        if (written>0){
+            offset += written;
+        }else{
+            break;
+        }
+    }
+    written = snprintf(output_str+offset, sizeof(output_str)-offset, "\n");
+    printf("%s", output_str);
+}
+
+void print_indices_ptr(int32_t* cpu_indices_ptr, int rank){
+    char output_str[1024];
+    int offset=0;
+    int written=0;
+    written = snprintf(output_str+offset, sizeof(output_str)-offset, "indices, rank=%d: ", rank);
+    offset += written;
+
+    for(int i=0; i<8; i++){
+        written = snprintf(output_str+offset, sizeof(output_str)-offset, "%d, ", cpu_indices_ptr[i]);
+        if (written>0){
+            offset += written;
+        }else{
+            break;
+        }
+    }
+    written = snprintf(output_str+offset, sizeof(output_str)-offset, "\n");
+    printf("%s", output_str);
+}
+
+void print_x_scale_ptr(float* cpu_x_scale_ptr, int rank){
+    char output_str[1024];
+    int offset=0;
+    int written=0;
+    written = snprintf(output_str+offset, sizeof(output_str)-offset, "x_scale_ptr, rank=%d: ", rank);
+    offset += written;
+
+    for(int i=0; i<16; i++){
+        written = snprintf(output_str+offset, sizeof(output_str)-offset, "%f, ", cpu_x_scale_ptr[i]);
+        if (written>0){
+            offset += written;
+        }else{
+            break;
+        }
+    }
+    written = snprintf(output_str+offset, sizeof(output_str)-offset, "\n");
+    printf("%s", output_str);
+}
+
+void print_send_buffer(float* my_send_buffer, int rank){
+    char output_str[1024];
+    int offset=0;
+    int written=0;
+    written = snprintf(output_str+offset, sizeof(output_str)-offset, "send_buffer, rank=%d: ", rank);
+    offset += written;
+
+    for(int i=0; i<4; i++){
+        written = snprintf(output_str+offset, sizeof(output_str)-offset, "%f, ", my_send_buffer[i]);
+        if (written>0){
+            offset += written;
+        }else{
+            break;
+        }
+    }
+    written = snprintf(output_str+offset, sizeof(output_str)-offset, " **** 1:");
+    offset += written;
+
+    for(int i=4; i<8; i++){
+        written = snprintf(output_str+offset, sizeof(output_str)-offset, "%f, ", my_send_buffer[i]);
+        if (written>0){
+            offset += written;
+        }else{
+            break;
+        }
+    }
+    written = snprintf(output_str+offset, sizeof(output_str)-offset, " **** 2:");
+    offset += written;
+
+    for(int i=8; i<12; i++){
+        written = snprintf(output_str+offset, sizeof(output_str)-offset, "%f, ", my_send_buffer[i]);
+        if (written>0){
+            offset += written;
+        }else{
+            break;
+        }
+    }
+    written = snprintf(output_str+offset, sizeof(output_str)-offset, " **** 3:");
+    offset += written;
+
+    for(int i=12; i<16; i++){
+        written = snprintf(output_str+offset, sizeof(output_str)-offset, "%f, ", my_send_buffer[i]);
+        if (written>0){
+            offset += written;
+        }else{
+            break;
+        }
+    }
+    written = snprintf(output_str+offset, sizeof(output_str)-offset, " **** 4:");
+    offset += written;
+
+    for(int i=16; i<20; i++){
+        written = snprintf(output_str+offset, sizeof(output_str)-offset, "%f, ", my_send_buffer[i]);
+        if (written>0){
+            offset += written;
+        }else{
+            break;
+        }
+    }
+    written = snprintf(output_str+offset, sizeof(output_str)-offset, " **** 5:");
+    offset += written;
+
+    for(int i=20; i<24; i++){
+        written = snprintf(output_str+offset, sizeof(output_str)-offset, "%f, ", my_send_buffer[i]);
+        if (written>0){
+            offset += written;
+        }else{
+            break;
+        }
+    }
+    written = snprintf(output_str+offset, sizeof(output_str)-offset, " **** 6:");
+    offset += written;
+
+    for(int i=24; i<28; i++){
+        written = snprintf(output_str+offset, sizeof(output_str)-offset, "%f, ", my_send_buffer[i]);
+        if (written>0){
+            offset += written;
+        }else{
+            break;
+        }
+    }
+    written = snprintf(output_str+offset, sizeof(output_str)-offset, " **** 7:");
+    offset += written;
+
+    for(int i=28; i<32; i++){
+        written = snprintf(output_str+offset, sizeof(output_str)-offset, "%f, ", my_send_buffer[i]);
+        if (written>0){
+            offset += written;
+        }else{
+            break;
+        }
+    }
+    written = snprintf(output_str+offset, sizeof(output_str)-offset, "\n");
+    offset += written;
+
+    printf("%s", output_str);
+    fflush(stdout);
+
+}
+
+void print_first64_floats(float* my_recv_buffer, int rank, int peer){
+
+    char output_str[1024];
+    int offset=0;
+    int written=0;
+    written = snprintf(output_str+offset, sizeof(output_str)-offset, "rank=%d, peer=%d, my_recv_buffer= 0:", rank, peer);
+    offset += written;
+
+    for(int i=0; i<4; i++){
+        written = snprintf(output_str+offset, sizeof(output_str)-offset, "%f, ", my_recv_buffer[i]);
+        if (written>0){
+            offset += written;
+        }else{
+            break;
+        }
+    }
+
+    written = snprintf(output_str+offset, sizeof(output_str)-offset, " **** 1:");
+    offset += written;
+
+    for(int i=4; i<8; i++){
+        written = snprintf(output_str+offset, sizeof(output_str)-offset, "%f, ", my_recv_buffer[i]);
+        if (written>0){
+            offset += written;
+        }else{
+            break;
+        }
+    }
+    written = snprintf(output_str+offset, sizeof(output_str)-offset, " **** 2:");
+    offset += written;
+
+    for(int i=8; i<12; i++){
+        written = snprintf(output_str+offset, sizeof(output_str)-offset, "%f, ", my_recv_buffer[i]);
+        if (written>0){
+            offset += written;
+        }else{
+            break;
+        }
+    }
+    written = snprintf(output_str+offset, sizeof(output_str)-offset, " **** 3:");
+    offset += written;
+
+    for(int i=12; i<16; i++){
+        written = snprintf(output_str+offset, sizeof(output_str)-offset, "%f, ", my_recv_buffer[i]);
+        if (written>0){
+            offset += written;
+        }else{
+            break;
+        }
+    }
+    written = snprintf(output_str+offset, sizeof(output_str)-offset, " **** 4:");
+    offset += written;
+
+
+    for(int i=16; i<20; i++){
+        written = snprintf(output_str+offset, sizeof(output_str)-offset, "%f, ", my_recv_buffer[i]);
+        if (written>0){
+            offset += written;
+        }else{
+            break;
+        }
+    }
+    written = snprintf(output_str+offset, sizeof(output_str)-offset, " **** 5:");
+    offset += written;
+
+    for(int i=20; i<24; i++){
+        written = snprintf(output_str+offset, sizeof(output_str)-offset, "%f, ", my_recv_buffer[i]);
+        if (written>0){
+            offset += written;
+        }else{
+            break;
+        }
+    }
+    written = snprintf(output_str+offset, sizeof(output_str)-offset, " **** 6:");
+    offset += written;
+
+    for(int i=24; i<28; i++){
+        written = snprintf(output_str+offset, sizeof(output_str)-offset, "%f, ", my_recv_buffer[i]);
+        if (written>0){
+            offset += written;
+        }else{
+            break;
+        }
+    }
+    written = snprintf(output_str+offset, sizeof(output_str)-offset, " **** 7:");
+    offset += written;
+
+    for(int i=28; i<32; i++){
+        written = snprintf(output_str+offset, sizeof(output_str)-offset, "%f, ", my_recv_buffer[i]);
+        if (written>0){
+            offset += written;
+        }else{
+            break;
+        }
+    }
+    written = snprintf(output_str+offset, sizeof(output_str)-offset, "\n");
+    offset += written;
+
+    printf("%s", output_str);
+    fflush(stdout);
+
+}
+
+int a2a_kernels::a2a_dispatch_send(
+    size_t num_blocks,
+    size_t hidden_dim,
+    size_t hidden_dim_scale,
+    size_t num_experts,
+    size_t num_experts_per_token,
+    size_t max_private_tokens,
+    size_t rank,
+    size_t dp_size,
+    size_t node_size,
+    size_t world_size,
+    size_t num_tokens,
+    const int32_t *bound_m_ptr,
+    const uint8_t *x_ptr,
+    size_t x_elemsize,
+    size_t x_stride,
+    const uint8_t *x_scale_ptr,
+    size_t x_scale_elemsize,
+    size_t x_scale_stride_elem,
+    size_t x_scale_stride_token,
+    const int32_t *indices,
+    size_t indices_stride,
+    const float *weights,
+    size_t weights_stride,
+    uint32_t *token_offset,
+    uint32_t *num_routed,
+    uint32_t *expert_offsets,
+    uint8_t *dispatch_route_done,
+    uint8_t *dispatch_send_done,
+    uint8_t *tx_ready,
+    uint8_t *send_buffer,
+    uint32_t *grid_counter,
+    uint32_t *sync_counter,
+    uint32_t **sync_ptrs,
+    uint8_t **recv_ptrs,
+    uint64_t stream
+) {
+
+    /*
+    // pxz
+    cudaSetDevice(rank);
+    for (int peer=0; peer<4; peer++){
+        if (peer==rank) continue;
+        int can_access = 0;
+        cudaError_t err = cudaDeviceCanAccessPeer(&can_access, rank, peer);
+        if (err!=cudaSuccess){
+            printf("cudaDeviceCanAccessPeer failed!\n");
+            return -1;
+        }
+    }
+    printf("cudaDeviceCanAccessPeer succeeded!\n");
+
+    dim3 debug_dimGrid(1,1,1);
+    dim3 debug_dimBlock(1,1,1);
+
+    printf("Running clear kernel:\n");
+    clear_kernel<<<debug_dimGrid, debug_dimBlock, 0, (cudaStream_t)stream>>>(static_cast<int>(rank), recv_ptrs);
+    cudaStreamSynchronize((cudaStream_t)stream);
+
+
+    printf("Before debug kernel:\n");
+    debug_print_kernel<<<debug_dimGrid, debug_dimBlock, 0, (cudaStream_t)stream>>>(static_cast<int>(rank), recv_ptrs);
+    cudaStreamSynchronize((cudaStream_t)stream);
+
+//    sync_kernel<<<debug_dimGrid, debug_dimBlock, 0, (cudaStream_t)stream>>>(static_cast<int>(rank), static_cast<int>(node_size), sync_ptrs, 1001);
+
+    debug_kernel<<<debug_dimGrid, debug_dimBlock, 0, (cudaStream_t)stream>>>(static_cast<int>(rank), static_cast<int>(node_size), recv_ptrs);
+    cudaStreamSynchronize((cudaStream_t)stream);
+    
+    sync_kernel<<<debug_dimGrid, debug_dimBlock, 0, (cudaStream_t)stream>>>(static_cast<int>(rank), static_cast<int>(node_size), sync_ptrs, 1002);
+
+    printf("after debug kernel:\n");
+    debug_print_kernel<<<debug_dimGrid, debug_dimBlock, 0, (cudaStream_t)stream>>>(static_cast<int>(rank), recv_ptrs);
+    cudaStreamSynchronize((cudaStream_t)stream);
+    */
+
+
+
+    constexpr size_t NUM_WARPS = 16;
+    constexpr size_t NUM_THREADS = NUM_WARPS * WARP_SIZE;
+
+    dim3 dimGrid(num_blocks, 1, 1);
+    dim3 dimBlock(NUM_THREADS, 1, 1);
+
+    // There should be enough warps to do a horizontal reduction across ranks.
+    assert(world_size <= NUM_THREADS);
+    assert(num_experts <= NUM_THREADS);
+
+    const size_t token_dim = round_up<size_t>(hidden_dim * x_elemsize, sizeof(int4));
+    const size_t token_scale_dim = round_up<size_t>(hidden_dim_scale * x_scale_elemsize, sizeof(int4));
+    //const size_t token_stride = token_dim + token_scale_dim + 16;
+    // pxz
+    const size_t token_stride = token_dim;
+    assert(token_stride % sizeof(int4) == 0);
+
+    void *args[] = {
+        const_cast<size_t *>(&token_dim),
+        const_cast<size_t *>(&token_scale_dim),
+        const_cast<size_t *>(&token_stride),
+        &hidden_dim,
+        &hidden_dim_scale,
+        &num_experts,
+        &num_experts_per_token,
+        &max_private_tokens,
+        &rank,
+        &dp_size,
+        &node_size,
+        &world_size,
+        &num_tokens,
+        &bound_m_ptr,
+        &x_ptr,
+        &x_elemsize,
+        &x_stride,
+        &x_scale_ptr,
+        &x_scale_elemsize,
+        &x_scale_stride_elem,
+        &x_scale_stride_token,
+        &indices,
+        &indices_stride,
+        &weights,
+        &weights_stride,
+        &token_offset,
+        &num_routed,
+        &expert_offsets,
+        &dispatch_route_done,
+        &dispatch_send_done,
+        &tx_ready,
+        &send_buffer,
+        &grid_counter,
+        &sync_counter,
+        &sync_ptrs,
+        &recv_ptrs,
+    };
+
+//    printf("Before calling dispatch_send_kernel: rank=%d, dp_size=%d, world_size=%d, num_tokens=%d, num_experts=%d, num_experts_per_token=%d\n", rank, dp_size, world_size, num_tokens, num_experts, num_experts_per_token);
+
+    const size_t shared_memory_send = std::max(num_experts, NUM_WARPS) * sizeof(uint32_t);
+
+    printf("WHICH BRANCH? num_blocks=%d, num_tokens=%d\n", num_blocks, num_tokens);
+
+    nvtxRangePush("dispatch_send");
+    cudaError_t status;
+    LAUNCH_TOKEN_DIM_DISPATCH(token_dim, TokenDim, {
+        LAUNCH_NUM_EXPERTS_PER_TOKEN(num_experts_per_token, NumExpertsPerToken, {
+            LAUNCH_HIDDEN_DIM_SCALE(hidden_dim_scale, HiddenDimScale, {
+                LAUNCH_WORLD_SIZE(node_size, NODE_SIZE, {
+                    if (num_blocks >= num_tokens) {
+                        status = cudaLaunchCooperativeKernel(
+                            (void *)&a2a_dispatch_send_kernel<
+                                true,
+                                NUM_WARPS,
+                                NODE_SIZE,
+                                TokenDim,
+                                HiddenDimScale,
+                                NumExpertsPerToken
+                            >,
+                            dimGrid,
+                            dimBlock,
+                            args,
+                            shared_memory_send,
+                            (cudaStream_t)stream
+                        );
+                    } else {
+                        status = cudaLaunchCooperativeKernel(
+                            (void *)&a2a_dispatch_send_kernel<
+                                false,
+                                NUM_WARPS,
+                                NODE_SIZE,
+                                TokenDim,
+                                HiddenDimScale,
+                                NumExpertsPerToken
+                            >,
+                            dimGrid,
+                            dimBlock,
+                            args,
+                            shared_memory_send,
+                            (cudaStream_t)stream
+                        );
+                    }
+                });
+            });
+        });
+    });
+    nvtxRangePop();
+
+    cudaStreamSynchronize((cudaStream_t)stream);
+
+    uint8_t** cpu_recv_ptrs = (uint8_t**)malloc(sizeof(uint8_t*)*4);
+    cudaMemcpy((void*)cpu_recv_ptrs, (const void*)recv_ptrs, sizeof(uint8_t*)*4, cudaMemcpyDeviceToHost);
+
+    // which device?
+    cudaPointerAttributes attr_0, attr_1, attr_2, attr_3;
+    cudaPointerGetAttributes(&attr_0, cpu_recv_ptrs[0]);
+    cudaPointerGetAttributes(&attr_1, cpu_recv_ptrs[1]);
+    cudaPointerGetAttributes(&attr_2, cpu_recv_ptrs[2]);
+    cudaPointerGetAttributes(&attr_3, cpu_recv_ptrs[3]);
+
+    //printf("rank=%d, recv_ptrs[0]->device:%d; recv_ptrs[1]->device:%d; recv_ptrs[2]->device:%d, recv_ptrs[3]->device:%d\n", rank, attr_0.device, attr_1.device, attr_2.device, attr_3.device);
+
+    CUdeviceptr dptr_0 = (CUdeviceptr)cpu_recv_ptrs[0];
+    CUdeviceptr dptr_1 = (CUdeviceptr)cpu_recv_ptrs[1];
+    CUdeviceptr dptr_2 = (CUdeviceptr)cpu_recv_ptrs[2];
+    CUdeviceptr dptr_3 = (CUdeviceptr)cpu_recv_ptrs[3];
+
+    CUdeviceptr base_0 = 0;
+    CUdeviceptr base_1 = 0;
+    CUdeviceptr base_2 = 0;
+    CUdeviceptr base_3 = 0;
+
+    size_t size_0 = 0;
+    size_t size_1 = 0;
+    size_t size_2 = 0;
+    size_t size_3 = 0;
+
+    cuMemGetAddressRange(&base_0, &size_0, dptr_0);
+    cuMemGetAddressRange(&base_1, &size_1, dptr_1);
+    cuMemGetAddressRange(&base_2, &size_2, dptr_2);
+    cuMemGetAddressRange(&base_3, &size_3, dptr_3);
+
+
+    /*
+    float* cpu_x_ptr = (float*)malloc(sizeof(float)*16);
+    cudaMemcpy((void*)cpu_x_ptr, (const void*)x_ptr, sizeof(float)*16, cudaMemcpyDeviceToHost);
+    print_x_ptr(cpu_x_ptr, rank);
+
+    float* cpu_x_scale_ptr = (float*)malloc(sizeof(float)*16);
+    cudaMemcpy((void*)cpu_x_scale_ptr, (const void*)x_scale_ptr, sizeof(float)*16, cudaMemcpyDeviceToHost);
+    print_x_scale_ptr(cpu_x_scale_ptr, rank);
+
+    //const int32_t *indices,
+    int32_t* cpu_indices_ptr = (int32_t*)malloc(sizeof(int32_t)*8);
+    cudaMemcpy((void*)cpu_indices_ptr, (const void*)indices, sizeof(int32_t)*8, cudaMemcpyDeviceToHost);
+    print_indices_ptr(cpu_indices_ptr, rank);
+
+
+
+    float* my_recv_buffer = (float*)malloc(sizeof(float)*32);
+    
+    for(int peer=0; peer<4; peer++){
+        cudaMemcpy((void*)my_recv_buffer, (const void*)cpu_recv_ptrs[peer], sizeof(float)*32, cudaMemcpyDeviceToHost);
+        print_first64_floats(my_recv_buffer, rank, peer);
+    }
+
+    // std::byte * __restrict__ send_buffer
+    float* my_send_buffer = (float*)malloc(sizeof(float)*32);
+    cudaMemcpy((void*)my_send_buffer, (const void*)send_buffer, sizeof(float)*32, cudaMemcpyDeviceToHost);
+    print_send_buffer(my_send_buffer, rank);
+    */
+
+    return status;
+}

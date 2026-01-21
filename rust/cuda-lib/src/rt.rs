@@ -71,6 +71,14 @@ pub fn cudaSetDevice(device: i32) -> CudaResult<()> {
     }
 }
 
+pub fn cudaGetDevice(device: &mut i32) -> CudaResult<()> {
+    let ret = unsafe { cudart_sys::cudaGetDevice(device) };
+    match ret {
+        0 => Ok(()),
+        _ => Err(CudartError::new(ret, "cudaGetDevice")),
+    }
+}
+
 pub fn cudaHostAlloc(size: usize, flags: u32) -> CudaResult<NonNull<c_void>> {
     let mut ptr = std::ptr::null_mut();
     let ret = unsafe { cudart_sys::cudaHostAlloc(&raw mut ptr, size, flags) };

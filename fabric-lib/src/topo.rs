@@ -155,6 +155,7 @@ struct PciDeviceId {
     device: u16,
 }
 
+/*
 fn get_numa_physical_cpus() -> Result<Vec<Vec<u16>>> {
     // Get all CPUs by NUMA node
     let mut numa_map = HashMap::new();
@@ -229,6 +230,203 @@ fn get_numa_physical_cpus() -> Result<Vec<Vec<u16>>> {
 
     Ok(numa)
 }
+*/
+/*
+fn get_numa_physical_cpus() -> Result<Vec<Vec<u16>>> {
+    let mut numa_cpus = Vec::new();
+    
+    // 首先尝试从 /sys/devices/system/node 获取 NUMA 信息
+    let mut has_numa_nodes = false;
+    
+    for entry in std::fs::read_dir("/sys/devices/system/node").map_err(|_| {
+        FabricLibError::Custom("Failed to read /sys/devices/system/node")
+    })? {
+        let entry = entry.map_err(|_| {
+            FabricLibError::Custom("Failed to read NUMA node entry")
+        })?;
+        
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        
+        let filename = path.file_name()
+            .and_then(|f| f.to_str())
+            .unwrap_or("");
+            
+        if !filename.starts_with("node") {
+            continue;
+        }
+        
+        has_numa_nodes = true;
+        
+        let numa_idx = filename[4..].parse::<usize>()
+            .map_err(|_| FabricLibError::Custom("Failed to parse NUMA node index"))?;
+        
+        let cpulist_path = path.join("cpulist");
+        let cpulist = match std::fs::read_to_string(&cpulist_path) {
+            Ok(content) => content,
+            Err(_) => continue,
+        };
+        
+        let cpus = parse_comma_dash_int_list(&cpulist);
+        
+        if numa_idx >= numa_cpus.len() {
+            numa_cpus.resize(numa_idx + 1, Vec::new());
+        }
+        
+        numa_cpus[numa_idx] = cpus;
+    }
+    
+    // 如果系统支持 NUMA，直接返回结果
+    if has_numa_nodes && !numa_cpus.is_empty() {
+        return Ok(numa_cpus);
+    }
+    
+    // ARM 系统通常没有 NUMA 或者只有一个 NUMA 节点
+    // 从 /proc/cpuinfo 获取所有逻辑 CPU
+    let cpuinfo = std::fs::read_to_string("/proc/cpuinfo")
+        .map_err(|_| FabricLibError::Custom("Failed to read /proc/cpuinfo"))?;
+    
+    let mut cpus = Vec::new();
+    
+    for line in cpuinfo.lines() {
+        if line.starts_with("processor") {
+            if let Some(colon_pos) = line.find(':') {
+                let cpu_id = line[colon_pos + 1..].trim()
+                    .parse::<u16>()
+                    .map_err(|_| FabricLibError::Custom("Failed to parse CPU ID"))?;
+                cpus.push(cpu_id);
+            }
+        }
+    }
+    
+    // 排序去重
+    cpus.sort_unstable();
+    cpus.dedup();
+    
+    if cpus.is_empty() {
+        // 回退方案：从 /sys/devices/system/cpu 获取
+        match std::fs::read_to_string("/sys/devices/system/cpu/online") {
+            Ok(online_cpus) => {
+                cpus = parse_comma_dash_int_list(&online_cpus);
+            }
+            Err(_) => {
+                // 最后尝试：通过 lscpu 命令获取 CPU 数
+                let output = std::process::Command::new("nproc")
+                    .output()
+                    .map_err(|_| FabricLibError::Custom("Failed to execute nproc"))?;
+                let cpu_count_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if let Ok(cpu_count) = cpu_count_str.parse::<u16>() {
+                    cpus = (0..cpu_count).collect();
+                }
+            }
+        }
+    }
+    
+    if cpus.is_empty() {
+        return Err(FabricLibError::Custom("Failed to detect any CPUs"));
+    }
+    
+    // ARM 系统通常只有一个 NUMA 节点
+    Ok(vec![cpus])
+}
+*/
+
+fn get_numa_physical_cpus() -> Result<Vec<Vec<u16>>> {
+    let mut numa_cpus_map = std::collections::HashMap::new();
+    let mut max_node = 0;
+    
+    // 遍历所有 NUMA 节点目录
+    for entry in std::fs::read_dir("/sys/devices/system/node").map_err(|_| {
+        FabricLibError::Custom("Failed to read /sys/devices/system/node")
+    })? {
+        let entry = entry.map_err(|_| {
+            FabricLibError::Custom("Failed to read NUMA node entry")
+        })?;
+        
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        
+        let filename = path.file_name()
+            .and_then(|f| f.to_str())
+            .unwrap_or("");
+            
+        if !filename.starts_with("node") {
+            continue;
+        }
+        
+        let node_id = filename[4..].parse::<usize>()
+            .map_err(|_| FabricLibError::Custom("Failed to parse NUMA node index"))?;
+        
+        max_node = max_node.max(node_id);
+        
+        let cpulist_path = path.join("cpulist");
+        let cpulist = match std::fs::read_to_string(&cpulist_path) {
+            Ok(content) => content,
+            Err(_) => continue, // 跳过无法读取的节点
+        };
+        
+        let cpus = parse_comma_dash_int_list(&cpulist);
+        if !cpus.is_empty() {
+            numa_cpus_map.insert(node_id, cpus);
+        }
+    }
+    
+    // 如果找到了 NUMA 节点
+    if !numa_cpus_map.is_empty() {
+        // 创建向量，只包含有 CPU 的节点
+        let mut numa_cpus = Vec::new();
+        for node_id in 0..=max_node {
+            if let Some(cpus) = numa_cpus_map.get(&node_id) {
+                numa_cpus.push(cpus.clone());
+            } else {
+                // 只添加有 CPU 的节点，空节点不添加
+                // 这样后续代码就不会访问到空节点
+            }
+        }
+        
+        // 如果没有节点有 CPU，回退到单节点
+        if numa_cpus.is_empty() {
+            get_fallback_cpus()
+        } else {
+            Ok(numa_cpus)
+        }
+    } else {
+        // 没有找到 NUMA 节点，回退
+        get_fallback_cpus()
+    }
+}
+
+fn get_fallback_cpus() -> Result<Vec<Vec<u16>>> {
+    // 从 /proc/cpuinfo 获取所有 CPU
+    let cpuinfo = std::fs::read_to_string("/proc/cpuinfo")
+        .map_err(|_| FabricLibError::Custom("Failed to read /proc/cpuinfo"))?;
+    
+    let mut cpus = Vec::new();
+    for line in cpuinfo.lines() {
+        if line.starts_with("processor") {
+            if let Some(colon_pos) = line.find(':') {
+                let cpu_str = &line[colon_pos + 1..].trim();
+                if let Ok(cpu_id) = cpu_str.parse::<u16>() {
+                    cpus.push(cpu_id);
+                }
+            }
+        }
+    }
+    
+    cpus.sort_unstable();
+    cpus.dedup();
+    
+    if cpus.is_empty() {
+        Err(FabricLibError::Custom("Failed to detect any CPUs"))
+    } else {
+        // 将所有 CPU 放在一个节点中
+        Ok(vec![cpus])
+    }
+}
 
 fn parse_comma_dash_int_list(s: &str) -> Vec<u16> {
     let mut result = Vec::new();
@@ -276,7 +474,7 @@ fn get_gpu_pci_device_id() -> Result<PciDeviceId> {
     read_pci_device_id(&pci_addr)
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct PciProp {
     pci_addr: PciAddress,
     pci_device_id: PciDeviceId,
@@ -380,6 +578,7 @@ fn scan_all_pci_devices() -> Result<Vec<PciProp>> {
     Ok(all_pcis)
 }
 
+#[derive(Clone, Debug)]
 struct PciTopoGroup {
     gpu: PciProp,
     nics: Vec<PciProp>,
@@ -397,14 +596,19 @@ fn detect_system_topo(
         nics: Vec<&'a PciProp>,
     }
 
+
     // Scan all PCI devices. Find all GPUs and NICs.
     let all_pcis = scan_all_pci_devices()?;
+
+
     let all_gpus: Vec<_> =
         all_pcis.iter().filter(|p| p.pci_device_id == gpu_pci_device_id).collect();
     let all_nics: Vec<_> =
         all_pcis.iter().filter(|p| p.pci_device_id == nic_pci_device_id).collect();
 
+
     // Build PciSwitchGroup
+    /*
     let mut switch_groups = HashMap::new();
     for gpu in &all_gpus {
         let group = switch_groups
@@ -420,12 +624,32 @@ fn detect_system_topo(
     }
     let mut switch_groups: Vec<_> = switch_groups.into_values().collect();
     switch_groups.sort_by_key(|g| g.gpus[0].pci_addr);
+    */
+
+    let mut switch_groups = HashMap::new();
+    for gpu in &all_gpus {
+        let group = switch_groups
+            .entry(gpu.numa_node)
+            .or_insert_with(|| PciSwitchGroup { gpus: Vec::new(), nics: Vec::new() });
+        group.gpus.push(gpu);
+    }
+    for nic in &all_nics {
+        let Some(group) = switch_groups.get_mut(&nic.numa_node) else {
+            continue;
+        };
+        group.nics.push(nic);
+    }
+    let mut switch_groups: Vec<_> = switch_groups.into_values().collect();
+    switch_groups.sort_by_key(|g| g.gpus[0].pci_addr);
+
 
     // Get NUMA physical CPUs
     let numa_cpus = get_numa_physical_cpus()?;
 
     // Count GPUs per NUMA node
     let mut numa_gpu_count = vec![0; numa_cpus.len()];
+
+
     for gpu in all_gpus {
         numa_gpu_count[gpu.numa_node] += 1;
     }
@@ -453,6 +677,7 @@ fn detect_system_topo(
             });
         }
     }
+
 
     Ok(system_topo)
 }
@@ -513,6 +738,8 @@ fn do_detect_topology() -> Result<Vec<TopologyGroup>> {
         let pci_addr = PciAddress::from(&prop);
         visible_gpus.insert(pci_addr, cuda_device);
     }
+
+
     let mut topo_groups = Vec::new();
     for group in system_topo {
         let Some(cuda_device) = visible_gpus.remove(&group.gpu.pci_addr) else {
@@ -529,12 +756,15 @@ fn do_detect_topology() -> Result<Vec<TopologyGroup>> {
             continue;
         }
 
+
+
         topo_groups.push(TopologyGroup {
             cuda_device: cuda_device as u8,
             numa: group.gpu.numa_node as u8,
             domains,
             cpus: group.cpus,
         });
+
     }
 
     Ok(topo_groups)

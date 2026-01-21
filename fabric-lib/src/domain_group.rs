@@ -192,6 +192,7 @@ impl<D: RdmaDomain, const N: usize> DomainGroup<D, N> {
             for dst_mr in dst_mrs {
                 let (dst_addr, dst_rkey) = &dst_mr.addr_rkey_list[i];
 
+
                 // Construct rdma op
                 let rdma_op = WriteOp::Imm(ImmWriteOp {
                     imm_data,

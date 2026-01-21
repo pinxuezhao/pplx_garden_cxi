@@ -5,11 +5,11 @@ import pickle
 import torch
 
 from pplx_garden.fabric_lib import TransferEngine
-from tests.markers import gpu_only, mark_fabric
+#from tests.markers import gpu_only, mark_fabric
 
 
-@mark_fabric
-@gpu_only
+#@mark_fabric
+#@gpu_only
 def test_pickle_unpickle_descriptor() -> None:
     # Build a transfer engine.
     group = TransferEngine.detect_topology()[0]
@@ -34,3 +34,5 @@ def test_pickle_unpickle_descriptor() -> None:
     pickled = pickle.dumps(descriptor)
     unpickled = pickle.loads(pickled)
     assert descriptor.as_bytes() == unpickled.as_bytes()
+
+test_pickle_unpickle_descriptor()

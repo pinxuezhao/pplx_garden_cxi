@@ -7,6 +7,9 @@ use std::{
     ptr::NonNull,
     sync::Arc,
     time::Instant,
+    // pxz
+    thread,
+    time::Duration,
 };
 
 use anyhow::anyhow;
@@ -276,13 +279,14 @@ fn alloc_and_register_memory(
     };
     let host_mr_handle =
         engine.register_memory_local(host_buf, MESSAGE_BUF_SIZE, Device::Host)?;
-    print!(" cpu");
+    println!(" cpu");
     stdout().flush()?;
 
     let mut cuda_res = Vec::new();
     for &cuda_device in selected_gpus {
         cudaSetDevice(cuda_device as i32)?;
         let cuda_buf = CudaDeviceMemory::device(CUDA_BUF_SIZE)?;
+        println!("cuda_device:{} allocated", cuda_device);
         let (cuda_mr_handle, cuda_mr_desc) = engine.register_memory_allow_remote(
             cuda_buf.ptr(),
             cuda_buf.size(),
@@ -294,7 +298,7 @@ fn alloc_and_register_memory(
             cuda_mr_handle,
             cuda_mr_desc,
         });
-        print!(" cuda:{}", cuda_device);
+        println!(" cuda:{} registered", cuda_device);
         stdout().flush()?;
     }
     println!();
@@ -344,6 +348,12 @@ fn do_bench_write(
             if let Some(seed) = paged.seed {
                 for (i, res) in cuda_res.iter().enumerate() {
                     let tmp = generate_random_paged_data(paged, seed, i);
+
+                    //println!("paged.indices.len()= {:?}", paged.indices.len());
+                    //println!("paged.len={:?}", paged.len);
+                    //println!("paged.stride={:?}", paged.stride);
+                    //println!("Server Paged tmp= {:02x?}", tmp);
+
                     memcpy_h2d(res.cuda_buf.ptr(), &tmp);
                 }
             }
@@ -383,6 +393,9 @@ fn do_bench_write(
             if let Some(seed) = single.seed {
                 let mut tmp = vec![0u8; single.len];
                 fill_random_bytes(&mut tmp, seed - 1);
+
+//                println!("Server tmp: {:02x?}", tmp);
+
                 memcpy_h2d(unsafe { res.cuda_buf.ptr().byte_add(single.offset) }, &tmp);
             }
 
@@ -576,7 +589,8 @@ fn generate_paged_write_request(
     verify: bool,
 ) -> Paged {
     let stride = page_bytes + 128;
-    let offset = 1024;
+//    let offset = 1024;
+    let offset = 0;
     let max_pages = (CUDA_BUF_SIZE - offset) / stride;
     let seed = if verify { Some(0xabcdabcd987u64) } else { None };
 
@@ -600,9 +614,20 @@ fn verify_paged_write(cuda_res: &[CudaResource], paged: &Paged) {
     if let Some(seed) = paged.seed {
         for (i, res) in cuda_res.iter().enumerate() {
             let gold = generate_random_paged_data(paged, seed, i);
+
+           // println!("Client Paged gold= {:02x?}", gold);
+
             let mut buf = vec![0u8; CUDA_BUF_SIZE];
             memcpy_d2h(&mut buf, res.cuda_buf.ptr());
+
+            //println!("Client Paged buf= {:02x?}", buf);
+
+            //println!("paged.offset={:?}", paged.offset);
+            //println!("paged.stride={:?}", paged.stride);
+
+
             for &page_idx in paged.indices.iter() {
+                //println!("page_idx={:?}", page_idx);
                 let offset = paged.offset + page_idx as usize * paged.stride;
                 let page_gold = &gold[offset..offset + paged.len];
                 let page_buf = &buf[offset..offset + paged.len];
@@ -618,6 +643,7 @@ fn generate_single_write_request(
     verify: bool,
 ) -> Single {
     let offset = 1024;
+    //let offset = 0;
     let seed = if verify { Some(0xabcdabcd987u64) } else { None };
 
     Single { seed, mr_desc: cuda_res[0].cuda_mr_desc.clone(), offset, len: write_bytes }
@@ -644,7 +670,7 @@ fn do_request(
 ) -> anyhow::Result<Response> {
     // Send request
     let request = Request {
-        meta: RequestMeta { addr: engine.main_address(), warmups: 50, repeats: 100 },
+        meta: RequestMeta { addr: engine.main_address(), warmups: 20, repeats: 40 },
         content: request_content,
     };
     let data = postcard::to_slice(&request, unsafe {
@@ -683,11 +709,13 @@ fn do_request(
         engine,
         TransferCompletionEntry::Recv { transfer_id, data_len } => (transfer_id, data_len)
     )?;
+    //println!("recv_complete, data_len={:?}", data_len);
 
     // Deserialize response
     let data =
         unsafe { std::slice::from_raw_parts(host_buf.as_ptr() as *const u8, data_len) };
     let response: Response = postcard::from_bytes(data)?;
+
 
     // Verify data
     match &request.content {
@@ -723,6 +751,7 @@ fn client_main(args: Vec<String>) -> anyhow::Result<()> {
         alloc_and_register_memory(&selected_gpus, &engine)?;
 
     println!("Bench Paged Write");
+    //println!("PXZ: how the target know the transfer ends??? The server sends a confirmation to the client.");
     for (page_bytes, num_pages, verify) in [
         (10000, 200, true),
         (1024, 10000, false),
@@ -765,8 +794,8 @@ fn client_main(args: Vec<String>) -> anyhow::Result<()> {
 
     println!("Bench Single Write");
     for (write_bytes, verify) in [
-        (10000, true),
-        (1 << 10, false),
+        (2048, true),
+        (1 << 10, true),
         (2 << 10, false),
         (4 << 10, false),
         (8 << 10, false),

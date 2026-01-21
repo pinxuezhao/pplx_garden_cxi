@@ -154,10 +154,17 @@ impl AllToAllContext {
         worker_cpu: Option<u16>,
     ) -> Result<Self> {
         // Start the all-to-all worker thread.
+        /*
         for (i, peer) in rank_handles.iter().enumerate() {
-            tracing::info!("Rank#{} Peer#{}: {}", rank, i, peer.address);
+            println!("Rank#{} Peer#{}: {}", rank, i, peer.address);
         }
-
+        let output: String = rank_handles.iter()
+            .enumerate()
+            .map(|(i, peer)| format!("Rank#{} Peer#{}: {}", rank, i, peer.address))
+            .collect::<Vec<String>>()
+            .join("---");  // 用换行符连接
+        println!("{}", output);
+        */
         let worker: Arc<WorkerState> = Arc::new(WorkerState::new(
             hidden_dim,
             hidden_dim_scale,
@@ -188,6 +195,8 @@ impl AllToAllContext {
 
         // Create the worker thread.
         let (init_tx, init_rx) = oneshot::channel();
+
+
         let thread = {
             let thread_worker = worker.clone();
             Some(
@@ -195,12 +204,13 @@ impl AllToAllContext {
                     .name("p2p_all_to_all Worker".to_string())
                     .spawn(move || {
                         // Pin to the desired CPU.
-                        tracing::info!("Running worker for cuda:{}", device);
+                        //tracing::info!("Running worker for cuda:{}", device);
+                        println!("Running worker for cuda:{}", device);
                         if let Some(cpu) = worker_cpu {
                             if let Err(e) = pin_cpu(cpu.into()) {
-                                tracing::info!("Failed to pin CPU {}: {:?}", cpu, e);
+                                println!("Failed to pin CPU {}: {:?}", cpu, e);
                             }
-                            tracing::info!(
+                            println!(
                                 "Pinned worker for cuda:{} to CPU {}",
                                 device,
                                 cpu
@@ -211,12 +221,12 @@ impl AllToAllContext {
                         if init_tx.send(()).is_err() {
                             panic!("Failed to send initialization signal");
                         } else {
-                            tracing::info!("Initialized worker for cuda:{}", device);
+                            println!("Initialized worker for cuda:{}", device);
                         }
 
                         // Main loop.
                         thread_worker.main_loop();
-                        tracing::info!("Stopping worker for cuda:{}", device);
+                        println!("Stopping worker for cuda:{}", device);
                     })
                     .expect("Failed to spawn p2p_all_to_all Worker thread"),
             )
@@ -260,7 +270,7 @@ impl AllToAllContext {
 
     pub fn destroy(&mut self) -> Result<()> {
         // Stop all work on the worker thread.
-        tracing::info!("Stopping worker thread for cuda:{}", self.device);
+        println!("Stopping worker thread for cuda:{}", self.device);
 
         self.worker.stop();
         if let Some(thread) = self.thread.take()
@@ -290,6 +300,7 @@ impl AllToAllContext {
         if num_tokens > self.max_num_tokens {
             return Err(anyhow!("Number of tokens exceeds maximum allowed"));
         }
+
 
         cuda_check!(a2a_kernels::a2a_dispatch_send(
             self.num_blocks,
@@ -329,6 +340,8 @@ impl AllToAllContext {
             stream,
         ))?;
 
+
+
         if self.worker.failed() {
             return Err(anyhow!("fabric-lib transfer error"));
         }
@@ -346,6 +359,8 @@ impl AllToAllContext {
         out_x_scale_stride_token: usize,
         stream: u64,
     ) -> Result<()> {
+
+
         cuda_check!(a2a_kernels::a2a_dispatch_recv(
             self.num_blocks,
             self.hidden_dim,
@@ -379,6 +394,8 @@ impl AllToAllContext {
             self.workspace.get_send_ptr() as *mut *mut u8,
             stream,
         ))?;
+
+
 
         if self.worker.failed() {
             return Err(anyhow!("fabric-lib transfer error"));

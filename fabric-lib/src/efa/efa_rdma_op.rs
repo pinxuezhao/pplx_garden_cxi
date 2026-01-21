@@ -41,7 +41,8 @@ impl SingleWriteOpIter {
             iov_len: op.length as usize,
         });
         let rma_iov = rma_iov.write(fi_rma_iov {
-            addr: op.dst_ptr + op.dst_offset,
+            //addr: op.dst_ptr + op.dst_offset,
+            addr: op.dst_offset,
             len: op.length as usize,
             key: op.dst_rkey.0,
         });
@@ -69,7 +70,8 @@ impl SingleWriteOpIter {
         // Even though RDMA spec says no need to specify rma_iov,
         // EFA still requires a valid rma_iov.
         let rma_iov =
-            rma_iov.write(fi_rma_iov { addr: op.dst_ptr, len: 0, key: op.dst_rkey.0 });
+//            rma_iov.write(fi_rma_iov { addr: op.dst_ptr, len: 0, key: op.dst_rkey.0 });
+            rma_iov.write(fi_rma_iov { addr: 0, len: 0, key: op.dst_rkey.0 });
         msg.write(fi_msg_rma {
             msg_iov: null(),
             desc: null_mut(),
@@ -195,7 +197,8 @@ impl PagedWriteOpIter {
         iov.iov_base = unsafe {
             self.src_ptr.as_ptr().byte_add(self.src_stride as usize * src_page_idx)
         };
-        rma_iov.addr = self.dst_ptr + self.dst_stride * dst_page_idx as u64;
+        //rma_iov.addr = self.dst_ptr + self.dst_stride * dst_page_idx as u64;
+        rma_iov.addr = self.dst_stride * dst_page_idx as u64;
     }
 }
 
@@ -254,6 +257,8 @@ impl ScatterWriteOpIter {
             i_dst: op.dst_beg,
         };
         slf.fill_msg();
+
+
         slf
     }
 
@@ -295,7 +300,8 @@ impl ScatterWriteOpIter {
             iov_len: len as usize,
         });
         rma_iov.write(fi_rma_iov {
-            addr: dst.dst_mr.ptr + dst.dst_offset + offset as u64,
+            //addr: dst.dst_mr.ptr + dst.dst_offset + offset as u64,
+            addr: dst.dst_offset + offset as u64,
             len: len as usize,
             key: dst.dst_mr.addr_rkey_list[self.domain_idx].1.0,
         });

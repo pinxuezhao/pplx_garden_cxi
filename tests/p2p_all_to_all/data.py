@@ -51,6 +51,9 @@ class RankTestData:
             indices.flatten().long(),
             minlength=num_experts,
         ).to(torch.int32)
+
+#        print("indices="+str(indices)+"  expected_num_tokens="+str(expected_num_tokens))
+
         return indices, expected_num_tokens
 
     @classmethod
