@@ -31,8 +31,8 @@ srun --ntasks-per-node=1 --export=ALL --mpi=pmix -ul \
             --world-size $((NUM_NODES * 4)) --nets-per-gpu 1 --init-method=tcp://$MASTER_IP:29500 \
             --node-rank=$NODE_RANK \
             --dp-size 1 \
-            --max-num-tokens 2048 \
-            --max-private-tokens 256 \
+            --max-num-tokens 128 \
+            --max-private-tokens 128 \
             --num-experts 256  \
             --hidden-dim 7168 \
             --hidden-dim-scale 56 \

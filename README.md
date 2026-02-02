@@ -3,6 +3,10 @@ pplx-garden
 
 Perplexity AI open source garden for inference technology
 
+## Update
+This library now works with CXI provider.
+
+
 ## Research Paper
 
 [RDMA Point-to-Point Communication for LLM Systems](https://arxiv.org/abs/2510.27656)

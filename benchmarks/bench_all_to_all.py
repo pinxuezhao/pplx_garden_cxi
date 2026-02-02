@@ -111,6 +111,8 @@ class AllToAllResource:
         )
 
 
+        print("num_dp_groups:"+str(num_dp_groups)+" cfg.max_num_tokens:"+str(cfg.max_num_tokens))
+
         self.num_tokens = num_tokens = num_dp_groups * cfg.max_num_tokens
         max_recv_tokens = round_up(
             max(
@@ -155,6 +157,7 @@ class AllToAllResource:
             dtype=torch.int32,
             device=device,
         )
+        # too large.
         self.out_expert_x = torch.empty(
             (max_recv_tokens, cfg.hidden_dim),
             dtype=cfg.in_dtype,
@@ -232,7 +235,6 @@ def correctness_check(r: AllToAllResource) -> None:
     )
 #    print("after dispatch, out_expert_x="+str(r.out_expert_x)+" out_expert_x_scale="+str(r.out_expert_x_scale))
 
-    """
 
     import pickle
     with open("/capstor/scratch/cscs/pzhao/PPLX_GARDEN/pplx-garden/dp_x_"+str(r.global_group.rank), "wb") as f:
@@ -243,9 +245,10 @@ def correctness_check(r: AllToAllResource) -> None:
         pickle.dump(r.out_expert_x.cpu(), f)
     with open("/capstor/scratch/cscs/pzhao/PPLX_GARDEN/pplx-garden/expert_x_scale_"+str(r.global_group.rank), "wb") as f:
         pickle.dump(r.out_expert_x_scale.cpu(), f)
+    with open("/capstor/scratch/cscs/pzhao/PPLX_GARDEN/pplx-garden/weights_"+str(r.global_group.rank), "wb") as f:
+        pickle.dump(local_rank.weights.cpu(), f)
 
     print("rank:"+str(r.global_group.rank)+" indices="+str(local_rank.indices))
-    """
 
     expert_y = act(r.out_expert_x, r.out_expert_x_scale).to(r.cfg.out_dtype)
     r.all_to_all.combine(
@@ -302,17 +305,40 @@ def correctness_check(r: AllToAllResource) -> None:
 
     # Verify the combine output.
 
-    """
     print("r.out_tokens:"+str(r.out_tokens)+" ref_out_tokens:"+str(ref_out_tokens))
     import pickle
     with open("/capstor/scratch/cscs/pzhao/PPLX_GARDEN/pplx-garden/out_tokens_"+str(r.global_group.rank), "wb") as f:
         pickle.dump(r.out_tokens.cpu(), f)
     with open("/capstor/scratch/cscs/pzhao/PPLX_GARDEN/pplx-garden/ref_out_tokens_"+str(r.global_group.rank), "wb") as f:
         pickle.dump(ref_out_tokens.cpu(), f)
-    """
     
 
     torch.testing.assert_close(r.out_tokens, ref_out_tokens)
+
+"""
+def benchmark_torch(
+    r: AllToAllResource, num_warmup: int, num_repeats: int, topk: int
+) -> None:
+    local_rank_data = r.create_rank_data(r.dp_rank)
+    (num_tokens, token_dim) = local_rank.dp_x.shape
+    device = local_rank.dp_x.device
+    dtype = local_rank.dp_x.dtype
+    data = torch.rand((num_tokens, token_dim, topk), device=device, dtype=dtype)
+    output = torch.empty_like(data)
+
+    torch.distributed.all_to_all_single(output, data, group=None)
+
+    torch_a2a_start = torch.cuda.Event(enable_timing=True)
+    torch_a2a_end = torch.cuda.Event(enable_timing=True)
+
+    for i in range(num_warmup+num_repears):
+        torch_a2a_start.record()
+        torch.distributed.all_to_all_single(output, data, group=None)
+        torch_a2a_stop.record()
+"""
+
+
+      
 
 
 def benchmark(
