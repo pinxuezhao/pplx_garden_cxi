@@ -111,7 +111,6 @@ class AllToAllResource:
         )
 
 
-        print("num_dp_groups:"+str(num_dp_groups)+" cfg.max_num_tokens:"+str(cfg.max_num_tokens))
 
         self.num_tokens = num_tokens = num_dp_groups * cfg.max_num_tokens
         max_recv_tokens = round_up(
@@ -125,7 +124,6 @@ class AllToAllResource:
             ),
             expert_padding,
         )
-#print("num_tokens="+str(num_tokens)+" num_experts_per_tokens="+str(cfg.num_experts_per_token)+" num_local_experts="+str(num_local_experts)+" expert_padding="+str(expert_padding))
 
         node_group: Optional[ParallelGroup] = None
         if cfg.nvlink is not None:
@@ -216,14 +214,11 @@ def correctness_check(r: AllToAllResource) -> None:
         dtype=torch.int32,
     ).to("cpu")
 
-#    print("dp_rank:"+str(r.dp_rank)+" expected_num_tokens="+str(expected_num_tokens))
 
     local_rank = r.create_rank_data(r.dp_rank)
     ref_out_tokens = act(local_rank.dp_x, local_rank.dp_x_scale).to(r.cfg.out_dtype)
 
     # Test run.
-# print("before dispatch, dp_x="+str(local_rank.dp_x)+"dp_x_scale="+str(local_rank.dp_x_scale)+" indices="+str(local_rank.indices)+" weights="+str(local_rank.weights))
-#    print("x_scale.shape:"+str(local_rank.dp_x_scale.shape)+" dp_x.shape:"+str(local_rank.dp_x.shape))
     r.all_to_all.dispatch(
         out_expert_num_tokens=r.expert_num_tokens,
         out_expert_x=r.out_expert_x,
@@ -233,22 +228,7 @@ def correctness_check(r: AllToAllResource) -> None:
         indices=local_rank.indices,
         weights=local_rank.weights,
     )
-#    print("after dispatch, out_expert_x="+str(r.out_expert_x)+" out_expert_x_scale="+str(r.out_expert_x_scale))
 
-
-    import pickle
-    with open("/capstor/scratch/cscs/pzhao/PPLX_GARDEN/pplx-garden/dp_x_"+str(r.global_group.rank), "wb") as f:
-        pickle.dump(local_rank.dp_x.cpu(), f)
-    with open("/capstor/scratch/cscs/pzhao/PPLX_GARDEN/pplx-garden/dp_x_scale_"+str(r.global_group.rank), "wb") as f:
-        pickle.dump(local_rank.dp_x_scale.cpu(), f)
-    with open("/capstor/scratch/cscs/pzhao/PPLX_GARDEN/pplx-garden/out_expert_x_"+str(r.global_group.rank), "wb") as f:
-        pickle.dump(r.out_expert_x.cpu(), f)
-    with open("/capstor/scratch/cscs/pzhao/PPLX_GARDEN/pplx-garden/expert_x_scale_"+str(r.global_group.rank), "wb") as f:
-        pickle.dump(r.out_expert_x_scale.cpu(), f)
-    with open("/capstor/scratch/cscs/pzhao/PPLX_GARDEN/pplx-garden/weights_"+str(r.global_group.rank), "wb") as f:
-        pickle.dump(local_rank.weights.cpu(), f)
-
-    print("rank:"+str(r.global_group.rank)+" indices="+str(local_rank.indices))
 
     expert_y = act(r.out_expert_x, r.out_expert_x_scale).to(r.cfg.out_dtype)
     r.all_to_all.combine(
@@ -266,7 +246,6 @@ def correctness_check(r: AllToAllResource) -> None:
     expected_local_tokens = expected_num_tokens[first_expert:last_expert]
     torch.testing.assert_close(expected_local_tokens, r.expert_num_tokens.to("cpu"))
 
-#    print("expected_local_tokens verified!! rank="+str(r.global_group.rank)+" expected_local_tokens="+str(expected_local_tokens))
 
     # Verify the tokens.
     def hash_token(x: torch.Tensor) -> str:
@@ -280,7 +259,6 @@ def correctness_check(r: AllToAllResource) -> None:
 
         index = round_up(index + n, r.expert_padding)
 
-#    print("rank="+str(r.global_group.rank)+" tokens_on_rank="+str(tokens_on_rank))
 
     # Verify the tokens on the rank.
     num_missing = 0
@@ -290,7 +268,6 @@ def correctness_check(r: AllToAllResource) -> None:
         if not any(first_expert <= route < last_expert for route in routes):
             continue
         key = hash_token(token)
-#print("key="+str(key))
         if key not in tokens_on_rank:
             num_missing += 1
             logger.error(
@@ -301,42 +278,10 @@ def correctness_check(r: AllToAllResource) -> None:
                 ", ".join(str(route) for route in routes),
             )
     assert num_missing == 0, f"Missing {num_missing} tokens on rank {r.dp_rank}"
-#print("num_missing=0, verified!")
 
     # Verify the combine output.
 
-    print("r.out_tokens:"+str(r.out_tokens)+" ref_out_tokens:"+str(ref_out_tokens))
-    import pickle
-    with open("/capstor/scratch/cscs/pzhao/PPLX_GARDEN/pplx-garden/out_tokens_"+str(r.global_group.rank), "wb") as f:
-        pickle.dump(r.out_tokens.cpu(), f)
-    with open("/capstor/scratch/cscs/pzhao/PPLX_GARDEN/pplx-garden/ref_out_tokens_"+str(r.global_group.rank), "wb") as f:
-        pickle.dump(ref_out_tokens.cpu(), f)
-    
-
     torch.testing.assert_close(r.out_tokens, ref_out_tokens)
-
-"""
-def benchmark_torch(
-    r: AllToAllResource, num_warmup: int, num_repeats: int, topk: int
-) -> None:
-    local_rank_data = r.create_rank_data(r.dp_rank)
-    (num_tokens, token_dim) = local_rank.dp_x.shape
-    device = local_rank.dp_x.device
-    dtype = local_rank.dp_x.dtype
-    data = torch.rand((num_tokens, token_dim, topk), device=device, dtype=dtype)
-    output = torch.empty_like(data)
-
-    torch.distributed.all_to_all_single(output, data, group=None)
-
-    torch_a2a_start = torch.cuda.Event(enable_timing=True)
-    torch_a2a_end = torch.cuda.Event(enable_timing=True)
-
-    for i in range(num_warmup+num_repears):
-        torch_a2a_start.record()
-        torch.distributed.all_to_all_single(output, data, group=None)
-        torch_a2a_stop.record()
-"""
-
 
       
 
