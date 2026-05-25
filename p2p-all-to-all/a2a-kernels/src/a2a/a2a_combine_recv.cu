@@ -81,6 +81,7 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_combine_recv_ker
     if (warp_id == 0) {
         if (elect_one_sync()) {
             while (ld_mmio_b8(combine_recv_flag) == 0);
+            fence_acquire_system();
         }
     } else if (warp_id == 1 && NODE_SIZE > 1) {
         auto local_rank = rank % NODE_SIZE;
@@ -152,6 +153,7 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_combine_recv_ker
     if (blockIdx.x == 0) {
         if (warp_id == 0) {
             if (elect_one_sync()) {
+                fence_release_system();
                 st_mmio_b8(combine_recv_done, 1);
                 *combine_recv_flag = 0;
                 *sync_counter = counter + 1;

@@ -3,7 +3,7 @@ use std::{ffi::c_void, ptr::null_mut, sync::Arc, thread::JoinHandle};
 use anyhow::{Result, anyhow};
 use cuda_lib::{
     CudaDeviceMemory, cuda_check,
-    rt::{CudartError, cudaGetNumSMs},
+    rt::{CudartError, cudaGetNumSMs, cudaSetDevice},
 };
 use fabric_lib::{TransferEngine, api::MemoryRegionHandle};
 use thread_lib::pin_cpu;
@@ -131,6 +131,7 @@ impl AllToAllContext {
         max_num_tokens: usize,
         max_recv_tokens: usize,
         max_private_tokens: usize,
+        expert_token_capacity: usize,
         num_experts: usize,
         expert_padding: usize,
         num_experts_per_token: usize,
@@ -165,6 +166,8 @@ impl AllToAllContext {
             .join("---");  // 用换行符连接
         println!("{}", output);
         */
+        cudaSetDevice(device as i32)?;
+
         let worker: Arc<WorkerState> = Arc::new(WorkerState::new(
             hidden_dim,
             hidden_dim_scale,
@@ -174,6 +177,7 @@ impl AllToAllContext {
             max_num_tokens,
             max_recv_tokens,
             max_private_tokens,
+            expert_token_capacity,
             num_experts,
             expert_padding,
             num_experts_per_token,
@@ -216,6 +220,8 @@ impl AllToAllContext {
                                 cpu
                             );
                         }
+                        cudaSetDevice(device as i32)
+                            .expect("Failed to set CUDA device for all-to-all worker");
 
                         // Block until the worker is fully initialized.
                         if init_tx.send(()).is_err() {
@@ -438,6 +444,7 @@ impl AllToAllContext {
             self.workspace.get_recv_ptr() as *mut *mut u8,
             stream,
         ))?;
+        self.worker.record_combine_send_event(stream)?;
 
         if self.worker.failed() {
             return Err(anyhow!("fabric-lib transfer error"));

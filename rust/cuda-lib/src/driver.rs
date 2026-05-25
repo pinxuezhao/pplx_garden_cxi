@@ -4,7 +4,9 @@ use std::{
 };
 
 use cuda_sys::{
-    CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, cuGetErrorString,
+    CU_FLUSH_GPU_DIRECT_RDMA_WRITES_TARGET_CURRENT_CTX,
+    CU_FLUSH_GPU_DIRECT_RDMA_WRITES_TO_OWNER, CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD,
+    cuFlushGPUDirectRDMAWrites, cuGetErrorString,
     cuMemGetHandleForAddressRange,
 };
 
@@ -53,5 +55,18 @@ pub fn cu_get_dma_buf_fd(ptr: NonNull<c_void>, len: usize) -> Result<i32> {
     match ret {
         0 => Ok(dmabuf_fd),
         _ => Err(CudaDriverError::new(ret, "cuMemGetHandleForAddressRange")),
+    }
+}
+
+pub fn cu_flush_gpu_direct_rdma_writes_to_owner() -> Result<()> {
+    let ret = unsafe {
+        cuFlushGPUDirectRDMAWrites(
+            CU_FLUSH_GPU_DIRECT_RDMA_WRITES_TARGET_CURRENT_CTX,
+            CU_FLUSH_GPU_DIRECT_RDMA_WRITES_TO_OWNER,
+        )
+    };
+    match ret {
+        0 => Ok(()),
+        _ => Err(CudaDriverError::new(ret, "cuFlushGPUDirectRDMAWrites")),
     }
 }

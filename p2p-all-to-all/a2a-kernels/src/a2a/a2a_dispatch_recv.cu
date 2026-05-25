@@ -93,6 +93,7 @@ void a2a_dispatch_recv_kernel(
     if (warp_id == 0) {
         if (elect_one_sync()) {
             while (ld_mmio_b8(num_recv_tokens_flag) == 0);
+            fence_acquire_system();
         }
     } else if (warp_id == 1) {
         if constexpr (NODE_SIZE > 1) {
@@ -175,6 +176,7 @@ void a2a_dispatch_recv_kernel(
     if (warp_id == 0) {
         if (elect_one_sync()) {
             while (ld_mmio_b8(dispatch_recv_flag) == 0);
+            fence_acquire_system();
         }
     }
     __syncthreads();
@@ -226,6 +228,7 @@ void a2a_dispatch_recv_kernel(
     if (threadIdx.x == 0) {
         auto counter = add_release_gpu_u32(grid_counter, num_local_tokens) + num_local_tokens;
         if (counter == num_efa_tokens) {
+            fence_release_system();
             st_mmio_b8(dispatch_recv_done, 1);
             // Reset the state.
             *num_recv_tokens_flag = 0;

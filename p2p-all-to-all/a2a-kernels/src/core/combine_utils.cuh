@@ -66,7 +66,7 @@ __forceinline__ __device__ Arg<__nv_bfloat16, 8>::Arg(const __nv_bfloat16 *ptr) 
         return __bfloat1622float2(temp.bvalue);
     };
 
-    uint4 data = ld_global_nc_uint4(ptr);
+    uint4 data = ld_volatile_global_uint4(ptr);
     auto v0 = from_uint32(data.x);
     v[0] = v0.x;
     v[1] = v0.y;

@@ -14,9 +14,33 @@ impl CudaEvent {
         Ok(CudaEvent { event })
     }
 
+    pub fn new_without_timing() -> CudaResult<Self> {
+        let mut event = std::ptr::null_mut();
+        let ret = unsafe {
+            cudart_sys::cudaEventCreateWithFlags(
+                &mut event,
+                cudart_sys::cudaEventDisableTiming,
+            )
+        };
+        if ret != 0 {
+            return Err(CudartError::new(ret, "cudaEventCreateWithFlags"));
+        }
+        Ok(CudaEvent { event })
+    }
+
     pub fn record(&self) -> CudaResult<()> {
         let ret =
             unsafe { cudart_sys::cudaEventRecord(self.event, std::ptr::null_mut()) };
+        if ret != 0 {
+            return Err(CudartError::new(ret, "cudaEventRecord"));
+        }
+        Ok(())
+    }
+
+    pub fn record_on_stream(&self, stream: u64) -> CudaResult<()> {
+        let ret = unsafe {
+            cudart_sys::cudaEventRecord(self.event, stream as cudart_sys::cudaStream_t)
+        };
         if ret != 0 {
             return Err(CudartError::new(ret, "cudaEventRecord"));
         }

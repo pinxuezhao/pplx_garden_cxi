@@ -119,6 +119,20 @@ __forceinline__ __device__ uint4 ld_global_nc_uint4(const void *ptr) {
   return v;
 }
 
+__forceinline__ __device__ uint4 ld_volatile_global_uint4(const void *ptr) {
+  uint4 v;
+  asm volatile(
+      "{ ld.volatile.global.v4.u32 {%0, %1, %2, %3}, [%4]; }"
+      : "=r"(v.x)
+      , "=r"(v.y)
+      , "=r"(v.z)
+      , "=r"(v.w)
+      : "l"(ptr)
+      : "memory"
+  );
+  return v;
+}
+
 __forceinline__ __device__ void st_global_nc_uint4(void *ptr, uint4 v) {
   asm volatile(
       "{ st.global.L1::no_allocate.v4.u32 [%0], {%1, %2, %3, %4}; }"

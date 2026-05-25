@@ -66,6 +66,7 @@ class P2PAllToAll(AllToAllKernel):
         dp_group: Optional[ParallelGroup],
         node_group: Optional[ParallelGroup],
         global_group: ParallelGroup,
+        expert_token_capacity: Optional[int] = None,
     ) -> None:
         self._hidden_dim = hidden_dim
         self._hidden_dim_scale = hidden_dim_scale
@@ -259,6 +260,8 @@ class P2PAllToAll(AllToAllKernel):
         else:
             logger.info("Setting up RDMA (%d)", global_group.size)
             node_size = 1
+            send_ptrs.append(self._send_buffer_mapping.data_ptr())
+            recv_ptrs.append(self._recv_buffer_mapping.data_ptr())
 
         # Collect the metadata associated with all ranks.
         gathered_rank_data = global_group.all_gather_object(
@@ -288,6 +291,7 @@ class P2PAllToAll(AllToAllKernel):
             max_num_tokens=max_num_tokens,
             max_recv_tokens=max_recv_tokens,
             max_private_tokens=max_private_tokens,
+            expert_token_capacity=expert_token_capacity,
             num_experts=num_experts,
             expert_padding=expert_padding,
             num_experts_per_token=num_experts_per_token,

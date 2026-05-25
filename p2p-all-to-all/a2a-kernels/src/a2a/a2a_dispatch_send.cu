@@ -203,6 +203,8 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
             local_num_routed[i] = expert_offset;
         }
         __syncthreads();
+        fence_release_system();
+        __syncthreads();
         if (threadIdx.x == 0) {
             st_mmio_b8(dispatch_route_done, 1);
         }
@@ -323,9 +325,16 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
                     }
                 }
 
+                // Every writer must publish its own payload stores before the
+                // block contributes to the host-visible completion counter.
+                __syncthreads();
+                fence_release_system();
+                __syncthreads();
+
                 if (threadIdx.x == 0) {
-                    auto counter = add_release_gpu_u32(grid_counter, 1) + 1;
+                    auto counter = add_release_sys_u32(grid_counter, 1) + 1;
                     if (counter == num_send_tokens) {
+                        fence_release_system();
                         st_mmio_b8(dispatch_send_done, 1);
                         *grid_counter = 0;
                     }
@@ -369,10 +378,13 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
                 }
 
                 __syncthreads();
+                fence_release_system();
+                __syncthreads();
 
                 if (threadIdx.x == 0) {
-                    auto counter = add_release_gpu_u32(grid_counter, 1) + 1;
+                    auto counter = add_release_sys_u32(grid_counter, 1) + 1;
                     if (counter == num_send_tokens) {
+                        fence_release_system();
                         st_mmio_b8(dispatch_send_done, 1);
                         *grid_counter = 0;
                     }
@@ -460,10 +472,13 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
             }
         }
         __syncthreads();
+        fence_release_system();
+        __syncthreads();
 
         if (threadIdx.x == 0) {
-            auto counter = add_release_gpu_u32(grid_counter, num_local_tokens) + num_local_tokens;
+            auto counter = add_release_sys_u32(grid_counter, num_local_tokens) + num_local_tokens;
             if (counter == num_send_tokens) {
+                fence_release_system();
                 st_mmio_b8(dispatch_send_done, 1);
                 *grid_counter = 0;
             }
