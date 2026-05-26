@@ -100,7 +100,7 @@ void a2a_dispatch_recv_kernel(
             auto local_rank = rank % NODE_SIZE;
             if (lane_id < NODE_SIZE) {
                 auto *flag_ptr = &sync_ptrs[local_rank][lane_id + NODE_SIZE];
-                while (ld_acquire_u32(flag_ptr) != counter);
+                while (!counter_at_least_u32(ld_acquire_u32(flag_ptr), counter));
             }
         }
     }

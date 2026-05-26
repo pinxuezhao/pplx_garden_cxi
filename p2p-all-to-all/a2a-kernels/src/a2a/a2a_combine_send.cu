@@ -16,6 +16,13 @@
 using namespace rose;
 using namespace rose::device;
 
+__global__ void a2a_signal_done_kernel(uint8_t * __restrict__ done) {
+    if (threadIdx.x == 0) {
+        fence_release_system();
+        st_mmio_b8(done, 1);
+    }
+}
+
 
 template <unsigned NUM_WARPS, unsigned NODE_SIZE, unsigned DP_SIZE, typename TokenDim>
 __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_combine_send_kernel(
@@ -73,17 +80,13 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_combine_send_ker
     if (warp_id == 0) {
         if (elect_one_sync()) {
             while (ld_mmio_b8(tx_ready) == 0);
-            if (num_efa_tokens == 0) {
-                fence_release_system();
-                st_mmio_b8(combine_send_done, 1);
-            }
         }
     } else if (warp_id == 1) {
         if constexpr (NODE_SIZE > 1) {
             auto local_rank = rank % NODE_SIZE;
             if (lane_id < NODE_SIZE) {
                 auto *flag = &sync_ptrs[lane_id][local_rank];
-                while (ld_volatile_u32(flag) != counter);
+                while (!counter_at_least_u32(ld_volatile_u32(flag), counter));
             }
         }
     } else if (warp_id == 2) {
@@ -149,20 +152,19 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_combine_send_ker
         shared_to_local(num_efa_tokens);
     }
 
-    // Every writer must publish its own payload stores before the block reports
-    // that its remote-send slice is ready for the NIC to read.
+    // Every writer must publish its own payload stores before the inter-block
+    // system progress point and the later stream-ordered completion marker.
     __syncthreads();
     if (num_efa_tokens != 0) {
         fence_release_system();
     }
     __syncthreads();
 
+    // Keep a system-scope progress point after the EFA send-buffer writes.
+    // The host-visible completion flag is set later by a stream-ordered marker.
     if (threadIdx.x == 0) {
         auto num_tokens = add_release_sys_u32(token_counter, num_local_efa_tokens) + num_local_efa_tokens;
-        if (num_tokens == num_efa_tokens) {
-            fence_release_system();
-            st_mmio_b8(combine_send_done, 1);
-        }
+        (void)num_tokens;
     }
 
     if (warp_id == 0) {
@@ -310,6 +312,10 @@ int a2a_kernels::a2a_combine_send(
             });
         });
     });
+    if (status == cudaSuccess) {
+        a2a_signal_done_kernel<<<1, 1, 0, (cudaStream_t)stream>>>(combine_send_done);
+        status = cudaGetLastError();
+    }
     nvtxRangePop();
     return status;
 }

@@ -346,8 +346,6 @@ impl AllToAllContext {
             stream,
         ))?;
 
-
-
         if self.worker.failed() {
             return Err(anyhow!("fabric-lib transfer error"));
         }
@@ -365,8 +363,6 @@ impl AllToAllContext {
         out_x_scale_stride_token: usize,
         stream: u64,
     ) -> Result<()> {
-
-
         cuda_check!(a2a_kernels::a2a_dispatch_recv(
             self.num_blocks,
             self.hidden_dim,
@@ -400,8 +396,6 @@ impl AllToAllContext {
             self.workspace.get_send_ptr() as *mut *mut u8,
             stream,
         ))?;
-
-
 
         if self.worker.failed() {
             return Err(anyhow!("fabric-lib transfer error"));
@@ -444,7 +438,6 @@ impl AllToAllContext {
             self.workspace.get_recv_ptr() as *mut *mut u8,
             stream,
         ))?;
-        self.worker.record_combine_send_event(stream)?;
 
         if self.worker.failed() {
             return Err(anyhow!("fabric-lib transfer error"));

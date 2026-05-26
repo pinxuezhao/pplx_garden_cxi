@@ -31,7 +31,8 @@ pub struct GdrCopyContext {
 }
 
 fn align_to(ptr: u64, alignment: usize) -> u64 {
-    (ptr + alignment as u64 - 1).div_ceil(alignment as u64) * alignment as u64
+    let alignment = alignment as u64;
+    ((ptr + alignment - 1) / alignment) * alignment
 }
 
 impl GdrCopyContext {

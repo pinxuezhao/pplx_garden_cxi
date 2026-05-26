@@ -1,4 +1,5 @@
 import pickle
+import threading
 from dataclasses import dataclass
 from typing import Optional, override
 
@@ -24,6 +25,24 @@ from pplx_garden.utils.math import ceil_div, round_up
 logger = logging_utils.get_logger(__name__)
 
 _PAGE_SIZE = 4096
+_IMM_BASE_START = 0x80000000
+_IMM_BASE_STRIDE = 16
+_IMM_BASE_MAX = 0xFFFFFFFF - _IMM_BASE_STRIDE
+
+_imm_base_lock = threading.Lock()
+_next_imm_base = _IMM_BASE_START
+
+
+def _allocate_imm_base() -> int:
+    global _next_imm_base
+    with _imm_base_lock:
+        imm_base = _next_imm_base
+        next_imm_base = imm_base + _IMM_BASE_STRIDE
+        if next_imm_base > _IMM_BASE_MAX:
+            msg = "P2PAllToAll immediate tag space exhausted"
+            raise RuntimeError(msg)
+        _next_imm_base = next_imm_base
+    return imm_base
 
 
 @dataclass
@@ -280,6 +299,11 @@ class P2PAllToAll(AllToAllKernel):
             for data in gathered_rank_data
         ]
 
+        # Each context owns five immediate tags: route, dispatch, combine, and
+        # two barriers. Reusing tags across layer contexts lets completions
+        # from one worker satisfy another worker's counters.
+        imm_base = _allocate_imm_base()
+
         # Set up the all-to-all context.
         self._all_to_all = AllToAllContext.create(
             hidden_dim=hidden_dim,
@@ -309,7 +333,7 @@ class P2PAllToAll(AllToAllKernel):
             send_ptrs=send_ptrs,
             recv_ptrs=recv_ptrs,
             device=device.index,
-            imm_base=0x80000000,
+            imm_base=imm_base,
             ranks=ranks,
             transfer_engine=self._transfer_engine,
             worker_cpu=worker_cpu,

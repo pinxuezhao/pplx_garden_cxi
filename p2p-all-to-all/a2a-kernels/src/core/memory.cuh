@@ -20,6 +20,10 @@ __forceinline__ __device__ uint32_t ld_acquire_u32(uint32_t *flag_addr) {
   return flag;
 }
 
+__forceinline__ __device__ bool counter_at_least_u32(uint32_t value, uint32_t target) {
+  return static_cast<int32_t>(value - target) >= 0;
+}
+
 __forceinline__ __device__ uint8_t ld_mmio_b8(uint8_t *flag_addr) {
   uint32_t tmp;
   asm volatile(

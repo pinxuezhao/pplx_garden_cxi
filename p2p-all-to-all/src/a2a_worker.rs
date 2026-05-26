@@ -10,7 +10,6 @@ use anyhow::{Context, Result};
 use cuda_lib::{
     CudaDeviceId, Device,
     driver::cu_flush_gpu_direct_rdma_writes_to_owner,
-    event::CudaEvent,
     gdr::{GdrCopyContext, GdrFlag, GdrVec},
 };
 use fabric_lib::{
@@ -24,8 +23,6 @@ use fabric_lib::{
 use nvtx::{range_end, range_start};
 
 use crate::a2a_handles::AllToAllRankHandle;
-
-const COMBINE_SEND_EVENT_SLOTS: usize = 8;
 
 pub(crate) struct WorkerBuffers {
     pub(crate) num_routed_ptr: *mut u32,
@@ -91,11 +88,6 @@ pub(crate) struct WorkerState {
     combine_barrier_counter: ImmCounter,
     tx_counter: Arc<AtomicI64>,
     err_counter: Arc<AtomicI64>,
-    step_counter: AtomicU32,
-    combine_send_event_sync: bool,
-    combine_send_events: Vec<CudaEvent>,
-    combine_send_event_recorded: AtomicU32,
-    combine_send_event_consumed: AtomicU32,
     route_write_op: TransferRequest,
     dispatch_barrier_write_op: TransferRequest,
     combine_barrier_write_op: TransferRequest,
@@ -104,6 +96,7 @@ pub(crate) struct WorkerState {
 #[derive(Debug)]
 struct RoutingInfo {
     num_recv_tx: u32,
+    num_combine_recv_imm: u32,
     dispatch_ranges: Arc<Vec<ScatterTarget>>,
     combine_ranges: Arc<Vec<ScatterTarget>>,
 }
@@ -180,8 +173,6 @@ impl WorkerState {
         let combine_barrier_imm = imm_base + 4;
         let combine_barrier_counter =
             transfer_engine.get_imm_counter(combine_barrier_imm);
-        let combine_send_event_sync =
-            Self::env_flag_enabled("PPLX_GARDEN_RDMA_SEND_EVENT_SYNC", true);
 
 
         // Prepare the re-usable command to send out routing info.
@@ -307,17 +298,6 @@ impl WorkerState {
             combine_barrier_counter,
             tx_counter: Arc::new(AtomicI64::new(0)),
             err_counter: Arc::new(AtomicI64::new(0)),
-            step_counter: AtomicU32::new(0),
-            combine_send_event_sync,
-            combine_send_events: if combine_send_event_sync {
-                (0..COMBINE_SEND_EVENT_SLOTS)
-                    .map(|_| CudaEvent::new_without_timing())
-                    .collect::<std::result::Result<Vec<_>, _>>()?
-            } else {
-                Vec::new()
-            },
-            combine_send_event_recorded: AtomicU32::new(0),
-            combine_send_event_consumed: AtomicU32::new(0),
             route_write_op,
             dispatch_barrier_write_op,
             combine_barrier_write_op,
@@ -341,16 +321,7 @@ impl WorkerState {
     }
 
     fn make_rdma_writes_visible_to_gpu(&self) {
-        let enable_flush = std::env::var("PPLX_GARDEN_RDMA_VISIBILITY_FLUSH")
-            .ok()
-            .map(|value| {
-                !matches!(
-                    value.to_ascii_lowercase().as_str(),
-                    "0" | "false" | "off" | "no"
-                )
-            })
-            .unwrap_or(true);
-        if enable_flush {
+        if Self::env_flag_enabled("PPLX_GARDEN_RDMA_VISIBILITY_FLUSH", true) {
             cu_flush_gpu_direct_rdma_writes_to_owner().unwrap_or_else(|error| {
                 panic!(
                     "failed to flush GPUDirect RDMA writes for rank {} cuda:{}: {}",
@@ -358,51 +329,6 @@ impl WorkerState {
                 )
             });
         }
-    }
-
-    pub(crate) fn record_combine_send_event(&self, stream: u64) -> Result<()> {
-        if !self.combine_send_event_sync {
-            return Ok(());
-        }
-        let target = self.combine_send_event_recorded.load(Ordering::Relaxed) + 1;
-        while target - self.combine_send_event_consumed.load(Ordering::Acquire)
-            > COMBINE_SEND_EVENT_SLOTS as u32
-        {
-            std::hint::spin_loop();
-        }
-        let slot = ((target - 1) as usize) % COMBINE_SEND_EVENT_SLOTS;
-        self.combine_send_events[slot].record_on_stream(stream)?;
-        self.combine_send_event_recorded.store(target, Ordering::Release);
-        Ok(())
-    }
-
-    fn wait_combine_send_event(&self, step_idx: u32) {
-        if !self.combine_send_event_sync {
-            return;
-        }
-        let target = step_idx.wrapping_add(1);
-        while self.combine_send_event_recorded.load(Ordering::Acquire) < target {
-            if !self.is_running() {
-                return;
-            }
-            std::hint::spin_loop();
-        }
-        let slot = ((target - 1) as usize) % COMBINE_SEND_EVENT_SLOTS;
-        self.combine_send_events[slot].synchronize().unwrap_or_else(|error| {
-            panic!(
-                "failed to synchronize combine-send event for rank {} cuda:{}: {}",
-                self.rank, self.device, error
-            )
-        });
-        self.combine_send_event_consumed.store(target, Ordering::Release);
-    }
-
-    fn release_combine_send_event_slot(&self, step_idx: u32) {
-        if !self.combine_send_event_sync {
-            return;
-        }
-        self.combine_send_event_consumed
-            .store(step_idx.wrapping_add(1), Ordering::Release);
     }
 
     pub fn stop(&self) {
@@ -507,7 +433,6 @@ impl WorkerState {
         if !self.is_running() {
             return;
         }
-        let step_idx = self.step_counter.fetch_add(1, Ordering::Relaxed);
 
         // pxz before exchanging routing info
 //        self.debug_num_routed(0);
@@ -543,12 +468,10 @@ impl WorkerState {
 //        self.debug_num_routed(2);
 
         // Register a callback to wait for the expected number of immediates.
-        let num_shards = self.transfer_engine.nets_per_gpu().get() as u32;
         let num_dispatch_tx = 1
             + if num_private_ranges == 0 { 0 } else { 1 }
             + if route.dispatch_ranges.is_empty() { 0 } else { 1 };
-        let num_combine_tx = 1 + if self.world_size > self.node_size { 1 } else { 0 };
-        let num_combine_imm = (self.world_size - self.node_size) as u32 * num_shards;
+        let num_combine_tx = 1 + if route.combine_ranges.is_empty() { 0 } else { 1 };
 
         // Dispatch stage.
         {
@@ -598,7 +521,8 @@ impl WorkerState {
             let combine_range = range_start!("combine");
 
             if !route.combine_ranges.is_empty() {
-                self.wait_combine_send_event(step_idx);
+                // a2a_combine_send records a stream-ordered device marker that
+                // sets combine_send_done after the send-buffer writes complete.
                 self.transfer_engine
                     .submit_transfer_atomic(
                         TransferRequest::Scatter(ScatterTransferRequest {
@@ -612,12 +536,10 @@ impl WorkerState {
                         self.err_counter.clone(),
                     )
                     .unwrap();
-            } else {
-                self.release_combine_send_event_slot(step_idx);
             }
 
             // Wait for all remote writes to complete.
-            self.combine_counter.wait(num_combine_imm);
+            self.combine_counter.wait(route.num_combine_recv_imm);
             self.make_rdma_writes_visible_to_gpu();
             self.combine_recv_flag.set(true);
 
@@ -671,12 +593,14 @@ impl WorkerState {
                 let dst_offset =
                     (token_dim * (self.dp_group * self.max_private_tokens)) as u64;
 
-                dsts.push(ScatterTarget {
-                    length: (token_dim * num_tokens) as u64,
-                    src_offset,
-                    dst_offset,
-                    dst_mr,
-                });
+                if num_tokens != 0 {
+                    dsts.push(ScatterTarget {
+                        length: (token_dim * num_tokens) as u64,
+                        src_offset,
+                        dst_offset,
+                        dst_mr,
+                    });
+                }
             }
         }
 
@@ -766,7 +690,7 @@ impl WorkerState {
                 num_recv_tokens += num_tokens;
                 //println!("rank={:?}, dp_group={:?}, num_tokens={:?}, num_recv_tokens={:?}, first_local_expert={:?}, last_local_expert={:?}", self.rank, dp_group, num_tokens, num_recv_tokens, first_local_expert, last_local_expert);
 
-                if dp_group != self.dp_group && group_node != rank_node {
+                if dp_group != self.dp_group && group_node != rank_node && num_tokens != 0 {
                     // Private buffer scatter shards by Peers.
                     num_recv_tx += 1;
                     // Overflow token scatter shards by Bytes.
@@ -927,6 +851,20 @@ impl WorkerState {
             }
         }
 
+        // Combine writes return results for the tokens this rank dispatched to
+        // remote ranks. That receive-side count is independent from the ranges
+        // this rank will send back for tokens it received from other ranks.
+        let mut num_combine_recv_imm = 0;
+        for peer_node in 1..(self.world_size / self.node_size) {
+            for index in 0..self.node_size {
+                let peer_rank = ((rank_node + peer_node) * self.node_size + index)
+                    % self.world_size;
+                if tokens_to_rank[peer_rank] != 0 {
+                    num_combine_recv_imm += nets_per_gpu;
+                }
+            }
+        }
+
         // Prepare the combine commands to remote nodes over EFA.
         let mut combine_ranges = Vec::with_capacity(self.world_size - 1);
         for peer_node in 1..(self.world_size / self.node_size) {
@@ -935,9 +873,13 @@ impl WorkerState {
                     ((rank_node + peer_node) * groups_per_node + index) % num_dp_groups;
                 for index in 0..self.dp_size {
                     let token_dim = self.get_combine_token_dim();
+                    let num_tokens = tokens_from_group[peer_group] as usize;
+                    if num_tokens == 0 {
+                        continue;
+                    }
 
                     let peer_rank = peer_group * self.dp_size + index;
-                    let length = token_dim * tokens_from_group[peer_group] as usize;
+                    let length = token_dim * num_tokens;
 
                     let src_offset =
                         src_group_offset[peer_group] as u64 * token_dim as u64;
@@ -959,6 +901,7 @@ impl WorkerState {
 
         RoutingInfo {
             num_recv_tx,
+            num_combine_recv_imm,
             dispatch_ranges: Arc::new(dispatch_ranges),
             combine_ranges: Arc::new(combine_ranges),
         }

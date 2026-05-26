@@ -20,7 +20,6 @@ struct ExpertAndOffset {
     float weight;
 };
 
-
 /// Wrapper class to efficiently access the expert indices and offsets.
 template<typename NumExpertsPerTokenTy>
 class ExpertIterator {
@@ -170,7 +169,6 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
     const size_t last_expert = min<size_t>(first_expert + experts_per_rank, num_experts);
 
     const size_t num_send_tokens = bound_m_ptr ? *bound_m_ptr : num_tokens;
-
     // In the first phase, count how many tokens are sent to each other rank
     // and assign a unique offset to each token within the ranks.
     if (blockIdx.x == 0) {
@@ -250,7 +248,7 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
         if (blockIdx.x == 0) {
             auto local_rank = rank % NODE_SIZE;
             for (unsigned peer = threadIdx.x; peer < NODE_SIZE; peer += blockDim.x) {
-                while (ld_volatile_u32(&sync_ptrs[local_rank][peer]) != counter);
+                while (!counter_at_least_u32(ld_volatile_u32(&sync_ptrs[local_rank][peer]), counter));
             }
         }
     }
@@ -269,7 +267,10 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
         unsigned token = blockIdx.x;
         if (token < num_send_tokens) {
             uint4 *x_token_src = (uint4*)(x_ptr + token * x_stride);
-            float *x_scale_src = (float*)(x_scale_ptr + token * x_scale_stride_token);
+            const float *x_scale_src = nullptr;
+            if (x_scale_ptr) {
+                x_scale_src = x_scale_ptr + token * x_scale_stride_token;
+            }
 
             ExpertIterator<NumExpertsPerTokenTy> expert_iterator(
                 num_experts_per_token_bound,
@@ -291,7 +292,7 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
                     uint4 val = ld_global_nc_uint4(&x_token_src[i]);
                     float scale_val;
                     if (has_scale) {
-                        scale_val =  *(float*)(x_scale_src + i * x_scale_stride_elem);
+                        scale_val = x_scale_src[i * x_scale_stride_elem];
                     }
 
                     // Copy from shared memory to the send buffer, ensuring a contiguous layout per rank.
@@ -351,7 +352,7 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
                     const bool has_scale = x_scale_ptr && i < hidden_dim_scale_bound;
                     vals[s] = ld_global_nc_uint4(&x_token_src[i]);
                     if (has_scale) {
-                        scales[s] = *(float*)(x_scale_src + i * x_scale_stride_elem);
+                        scales[s] = x_scale_src[i * x_scale_stride_elem];
                     }
                 }
 
@@ -424,7 +425,10 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
         unsigned num_local_tokens = 0;
         for (unsigned token = blockIdx.x; token < num_send_tokens; token += gridDim.x, num_local_tokens++) {
             uint4 *x_token_src = (uint4*)(x_ptr + token * x_stride);
-            float *x_scale_src = (float*)(x_scale_ptr + token * x_scale_stride_token);
+            const float *x_scale_src = nullptr;
+            if (x_scale_ptr) {
+                x_scale_src = x_scale_ptr + token * x_scale_stride_token;
+            }
 
             ExpertIterator<NumExpertsPerTokenTy> expert_iterator(
                 num_experts_per_token_bound,
@@ -446,7 +450,7 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
                 uint4 val = ld_global_nc_uint4(&x_token_src[i]);
                 float scale_val;
                 if (has_scale) {
-                    scale_val =  *(float*)(x_scale_src + i * x_scale_stride_elem);
+                    scale_val = x_scale_src[i * x_scale_stride_elem];
                 }
 
                 // Copy from shared memory to the send buffer, ensuring a contiguous layout per rank.
@@ -487,7 +491,10 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
         if (NODE_SIZE >= 1) {
             for (unsigned token = blockIdx.x; token < num_send_tokens; token += gridDim.x) {
                 uint4 *x_token_src = (uint4*)(x_ptr + token * x_stride);
-                float *x_scale_src = (float*)(x_scale_ptr + token * x_scale_stride_token);
+                const float *x_scale_src = nullptr;
+                if (x_scale_ptr) {
+                    x_scale_src = x_scale_ptr + token * x_scale_stride_token;
+                }
 
                 ExpertIterator<NumExpertsPerTokenTy> expert_iterator(
                     num_experts_per_token_bound,
@@ -508,7 +515,7 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
                     uint4 val = ld_global_nc_uint4(&x_token_src[i]);
                     float scale_val;
                     if (has_scale) {
-                        scale_val =  *(float*)(x_scale_src + i * x_scale_stride_elem);
+                        scale_val = x_scale_src[i * x_scale_stride_elem];
                     }
 
                     // Copy from shared memory to the send buffer, ensuring a contiguous layout per rank.
