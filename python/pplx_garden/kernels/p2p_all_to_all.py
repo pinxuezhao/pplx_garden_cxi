@@ -355,6 +355,9 @@ class P2PAllToAll(AllToAllKernel):
         bound_m: Optional[torch.Tensor] = None,
         do_send: bool = True,
         do_recv: bool = True,
+        out_recv_topk_idx: Optional[torch.Tensor] = None,
+        out_recv_topk_weights: Optional[torch.Tensor] = None,
+        out_recv_src_token_idx: Optional[torch.Tensor] = None,
     ) -> None:
         assert self._all_to_all is not None
         assert do_send or do_recv
@@ -388,6 +391,33 @@ class P2PAllToAll(AllToAllKernel):
             out_x_scale_ptr = None
             out_x_scale_stride_elem = None
             out_x_scale_stride_token = None
+
+        metadata_args = (
+            out_recv_topk_idx,
+            out_recv_topk_weights,
+            out_recv_src_token_idx,
+        )
+        if any(arg is not None for arg in metadata_args):
+            assert all(arg is not None for arg in metadata_args)
+            assert out_recv_topk_idx is not None
+            assert out_recv_topk_weights is not None
+            assert out_recv_src_token_idx is not None
+            assert out_recv_topk_idx.shape == (num_expert_tokens,)
+            assert out_recv_topk_weights.shape == (num_expert_tokens,)
+            assert out_recv_src_token_idx.shape == (num_expert_tokens,)
+            assert out_recv_topk_idx.stride(0) == 1
+            assert out_recv_topk_weights.stride(0) == 1
+            assert out_recv_src_token_idx.stride(0) == 1
+            assert out_recv_topk_idx.dtype == torch.int32
+            assert out_recv_topk_weights.dtype == torch.float32
+            assert out_recv_src_token_idx.dtype == torch.int32
+            out_recv_topk_idx_ptr = out_recv_topk_idx.data_ptr()
+            out_recv_topk_weights_ptr = out_recv_topk_weights.data_ptr()
+            out_recv_src_token_idx_ptr = out_recv_src_token_idx.data_ptr()
+        else:
+            out_recv_topk_idx_ptr = None
+            out_recv_topk_weights_ptr = None
+            out_recv_src_token_idx_ptr = None
 
         # Verify the input tokens.
         assert dp_x.shape == (num_tokens, self._hidden_dim)
@@ -464,6 +494,9 @@ class P2PAllToAll(AllToAllKernel):
                 out_x_scale_ptr=out_x_scale_ptr,
                 out_x_scale_stride_elem=out_x_scale_stride_elem,
                 out_x_scale_stride_token=out_x_scale_stride_token,
+                out_recv_topk_idx=out_recv_topk_idx_ptr,
+                out_recv_topk_weights=out_recv_topk_weights_ptr,
+                out_recv_src_token_idx=out_recv_src_token_idx_ptr,
                 stream=stream,
             )
 
@@ -474,6 +507,8 @@ class P2PAllToAll(AllToAllKernel):
         indices: torch.Tensor,
         weights: torch.Tensor,
         expert_y: torch.Tensor,
+        recv_src_token_idx: Optional[torch.Tensor] = None,
+        recv_topk_weights: Optional[torch.Tensor] = None,
         bound_m: Optional[torch.Tensor] = None,
         do_send: bool = True,
         do_recv: bool = True,
@@ -511,6 +546,21 @@ class P2PAllToAll(AllToAllKernel):
         expert_y_ptr = expert_y.data_ptr()
         expert_y_stride = expert_y.stride(0) * expert_y.dtype.itemsize
 
+        if recv_src_token_idx is not None or recv_topk_weights is not None:
+            assert recv_src_token_idx is not None
+            assert recv_topk_weights is not None
+            assert recv_src_token_idx.shape == (num_recv_tokens,)
+            assert recv_topk_weights.shape == (num_recv_tokens,)
+            assert recv_src_token_idx.stride(0) == 1
+            assert recv_topk_weights.stride(0) == 1
+            assert recv_src_token_idx.dtype == torch.int32
+            assert recv_topk_weights.dtype == torch.float32
+            recv_src_token_idx_ptr = recv_src_token_idx.data_ptr()
+            recv_topk_weights_ptr = recv_topk_weights.data_ptr()
+        else:
+            recv_src_token_idx_ptr = None
+            recv_topk_weights_ptr = None
+
         bound_m_ptr: Optional[int]
         if bound_m is not None:
             assert bound_m.numel() == 1
@@ -525,6 +575,8 @@ class P2PAllToAll(AllToAllKernel):
             self._all_to_all.combine_send(
                 expert_x_ptr=expert_y_ptr,
                 expert_x_stride=expert_y_stride,
+                recv_src_token_idx=recv_src_token_idx_ptr,
+                recv_topk_weights=recv_topk_weights_ptr,
                 stream=stream,
             )
 
@@ -539,6 +591,8 @@ class P2PAllToAll(AllToAllKernel):
                 indices_stride=indices_stride,
                 weights_ptr=weights_ptr,
                 weights_stride=weights_stride,
+                recv_src_token_idx=recv_src_token_idx_ptr,
+                recv_topk_weights=recv_topk_weights_ptr,
                 bound_m_ptr=bound_m_ptr,
                 accumulate=accumulate,
                 stream=stream,

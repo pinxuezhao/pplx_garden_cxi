@@ -16,6 +16,9 @@ class AllToAllKernel(Protocol):
         bound_m: Optional[torch.Tensor] = None,
         do_send: bool = True,
         do_recv: bool = True,
+        out_recv_topk_idx: Optional[torch.Tensor] = None,
+        out_recv_topk_weights: Optional[torch.Tensor] = None,
+        out_recv_src_token_idx: Optional[torch.Tensor] = None,
     ) -> None: ...
 
     def combine(
@@ -24,6 +27,8 @@ class AllToAllKernel(Protocol):
         indices: torch.Tensor,
         weights: torch.Tensor,
         expert_y: torch.Tensor,
+        recv_src_token_idx: Optional[torch.Tensor] = None,
+        recv_topk_weights: Optional[torch.Tensor] = None,
         bound_m: Optional[torch.Tensor] = None,
         do_send: bool = True,
         do_recv: bool = True,

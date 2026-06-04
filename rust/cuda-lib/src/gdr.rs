@@ -187,7 +187,7 @@ impl GdrFlag {
         self.buffer.write(value as u8);
     }
 
-    fn is_set(&self) -> bool {
+    pub fn is_set(&self) -> bool {
         self.buffer.read::<u8>() != 0
     }
 }

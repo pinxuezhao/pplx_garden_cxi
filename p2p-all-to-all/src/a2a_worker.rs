@@ -359,7 +359,7 @@ impl WorkerState {
     }
 
     fn get_combine_token_dim(&self) -> usize {
-        (self.hidden_dim * self.out_elemsize).div_ceil(16) * 16
+        (self.hidden_dim * self.out_elemsize).div_ceil(16) * 16 + 16
     }
 
     fn debug_num_routed(&self, flag: usize) {
@@ -483,7 +483,7 @@ impl WorkerState {
                         TransferRequest::Scatter(ScatterTransferRequest {
                             src_mr: self.send_buffer_mr,
                             dst_handle: None,
-                            dsts: route.dispatch_ranges,
+                            dsts: route.dispatch_ranges.clone(),
                             imm_data: Some(self.dispatch_imm),
                             domain: GroupTransferRouting::AllDomainsShardBytes,
                         }),
@@ -510,44 +510,57 @@ impl WorkerState {
             num_dispatch_tx,
         );
 
-        // Combine stage.
-        {
-            self.combine_send_done.wait();
-            if !self.is_running() {
+        self.run_combine(&route, num_combine_tx);
+        while self.is_running() {
+            while self.is_running()
+                && !self.combine_send_done.is_set()
+                && !self.dispatch_route_done.is_set()
+            {
+                std::hint::spin_loop();
+            }
+            if !self.is_running() || self.dispatch_route_done.is_set() {
                 return;
             }
-
-            // Sent the tokens.
-            let combine_range = range_start!("combine");
-
-            if !route.combine_ranges.is_empty() {
-                // a2a_combine_send records a stream-ordered device marker that
-                // sets combine_send_done after the send-buffer writes complete.
-                self.transfer_engine
-                    .submit_transfer_atomic(
-                        TransferRequest::Scatter(ScatterTransferRequest {
-                            src_mr: self.send_buffer_mr,
-                            dst_handle: None,
-                            dsts: route.combine_ranges,
-                            imm_data: Some(self.combine_imm),
-                            domain: GroupTransferRouting::AllDomainsShardBytes,
-                        }),
-                        self.tx_counter.clone(),
-                        self.err_counter.clone(),
-                    )
-                    .unwrap();
-            }
-
-            // Wait for all remote writes to complete.
-            self.combine_counter.wait(route.num_combine_recv_imm);
-            self.make_rdma_writes_visible_to_gpu();
-            self.combine_recv_flag.set(true);
-
-            // Let the recv phase output the tokens and proceed forward.
-            self.combine_recv_done.wait();
-
-            range_end!(combine_range);
+            self.run_combine(&route, num_combine_tx);
         }
+    }
+
+    fn run_combine(&self, route: &RoutingInfo, num_combine_tx: u32) {
+        self.combine_send_done.wait();
+        if !self.is_running() {
+            return;
+        }
+
+        // Sent the tokens.
+        let combine_range = range_start!("combine");
+
+        if !route.combine_ranges.is_empty() {
+            // a2a_combine_send records a stream-ordered device marker that
+            // sets combine_send_done after the send-buffer writes complete.
+            self.transfer_engine
+                .submit_transfer_atomic(
+                    TransferRequest::Scatter(ScatterTransferRequest {
+                        src_mr: self.send_buffer_mr,
+                        dst_handle: None,
+                        dsts: route.combine_ranges.clone(),
+                        imm_data: Some(self.combine_imm),
+                        domain: GroupTransferRouting::AllDomainsShardBytes,
+                    }),
+                    self.tx_counter.clone(),
+                    self.err_counter.clone(),
+                )
+                .unwrap();
+        }
+
+        // Wait for all remote writes to complete.
+        self.combine_counter.wait(route.num_combine_recv_imm);
+        self.make_rdma_writes_visible_to_gpu();
+        self.combine_recv_flag.set(true);
+
+        // Let the recv phase output the tokens and proceed forward.
+        self.combine_recv_done.wait();
+
+        range_end!(combine_range);
 
         self.barrier(
             self.combine_barrier_write_op.clone(),

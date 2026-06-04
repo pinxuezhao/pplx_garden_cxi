@@ -16,10 +16,36 @@
 using namespace rose;
 using namespace rose::device;
 
+struct CombinePayloadMeta {
+    int32_t src_token_idx;
+    float weight;
+    int32_t reserved0;
+    int32_t reserved1;
+};
+static_assert(sizeof(CombinePayloadMeta) == 16);
+
+__forceinline__ __device__ float combine_weight(
+    const std::byte *recv_buffer,
+    size_t token_dim,
+    size_t token_stride,
+    uint32_t position,
+    uint32_t token,
+    float fallback_weight,
+    bool use_payload_meta
+) {
+    if (!use_payload_meta) {
+        return fallback_weight;
+    }
+    const auto *meta = reinterpret_cast<const CombinePayloadMeta *>(
+        recv_buffer + position * token_stride + token_dim
+    );
+    return meta->src_token_idx == static_cast<int32_t>(token) ? meta->weight : 0.0f;
+}
 
 template <unsigned NUM_WARPS, unsigned NODE_SIZE, typename T, typename U, typename NumExpertsPerToken>
 __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_combine_recv_kernel(
     const size_t token_dim,
+    const size_t token_stride,
     size_t hidden_dim,
     size_t num_experts,
     size_t num_experts_per_token,
@@ -31,6 +57,8 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_combine_recv_ker
     const size_t indices_stride,
     const float *weights_ptr,
     const size_t weights_stride,
+    const int32_t *recv_src_token_idx,
+    const float *recv_topk_weights,
     U *out_tokens_ptr,
     size_t out_tokens_stride,
     uint8_t accumulate,
@@ -47,6 +75,7 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_combine_recv_ker
     auto grid = cooperative_groups::this_grid();
     const unsigned warp_id = threadIdx.x / WARP_SIZE;
     const unsigned lane_id = get_lane_id();
+    const bool use_payload_meta = recv_src_token_idx && recv_topk_weights;
 
     // Determine the number of tokens to combine on the current rank.
     const size_t num_send_tokens = bound_m_ptr ? *bound_m_ptr : num_tokens;
@@ -108,10 +137,19 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_combine_recv_ker
 
                 #pragma unroll(8)
                 for (unsigned k = 0; k < experts_per_token_bound; ++k) {
-                    const float weight = weights_ptr[token * weights_stride + k];
                     const uint32_t position = positions[local_token * num_experts_per_token + k];
+                    const float fallback_weight = weights_ptr[token * weights_stride + k];
+                    const float weight = combine_weight(
+                        recv_buffer,
+                        token_dim,
+                        token_stride,
+                        position,
+                        token,
+                        fallback_weight,
+                        use_payload_meta
+                    );
 
-                    T *buffer = (T*)(recv_buffer + position * token_dim);
+                    T *buffer = (T*)(recv_buffer + position * token_stride);
                     acc.add(weight, SrcTy(buffer + j));
                 }
 
@@ -125,8 +163,17 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_combine_recv_ker
             #pragma unroll(NUM_EXPERTS)
             for (unsigned k = 0; k < NUM_EXPERTS; ++k) {
                 const uint32_t position = positions[local_token * num_experts_per_token + k];
-                tokens[k] = (T*)(recv_buffer + position * token_dim);
-                weights[k] = weights_ptr[token * weights_stride + k];
+                tokens[k] = (T*)(recv_buffer + position * token_stride);
+                const float fallback_weight = weights_ptr[token * weights_stride + k];
+                weights[k] = combine_weight(
+                    recv_buffer,
+                    token_dim,
+                    token_stride,
+                    position,
+                    token,
+                    fallback_weight,
+                    use_payload_meta
+                );
             }
 
             for (unsigned j = threadIdx.x * VEC_SIZE; j < hidden_dim; j += blockDim.x * VEC_SIZE) {
@@ -186,6 +233,8 @@ int a2a_kernels::a2a_combine_recv(
     size_t indices_stride,
     const float *weights_ptr,
     size_t weights_stride,
+    const int32_t *recv_src_token_idx,
+    const float *recv_topk_weights,
     uint8_t *out_tokens_ptr,
     size_t out_tokens_stride,
     bool accumulate,
@@ -199,10 +248,12 @@ int a2a_kernels::a2a_combine_recv(
     uint64_t stream
 ) {
     const size_t token_dim = round_up<size_t>(hidden_dim * x_elemsize, sizeof(int4));
+    const size_t token_stride = token_dim + sizeof(CombinePayloadMeta);
     const size_t tokens_per_block = ceil_div<size_t>(num_tokens, num_blocks);
 
     void *args[] = {
         const_cast<size_t *>(&token_dim),
+        const_cast<size_t *>(&token_stride),
         &hidden_dim,
         &num_experts,
         &num_experts_per_token,
@@ -214,6 +265,8 @@ int a2a_kernels::a2a_combine_recv(
         &indices_stride,
         &weights_ptr,
         &weights_stride,
+        &recv_src_token_idx,
+        &recv_topk_weights,
         &out_tokens_ptr,
         &out_tokens_stride,
         &accumulate,

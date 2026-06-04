@@ -13,6 +13,35 @@
 using namespace rose;
 using namespace rose::device;
 
+struct DispatchPayloadMeta {
+    int32_t src_token_idx;
+    int32_t topk_idx;
+    int32_t expert_id;
+    float weight;
+};
+static_assert(sizeof(DispatchPayloadMeta) == 16);
+
+__forceinline__ __device__ void unpack_dispatch_payload_meta(
+    const uint4 *x_token_src,
+    size_t token_dim,
+    size_t token_scale_dim,
+    size_t first_expert,
+    uint32_t padded_token,
+    int32_t *out_recv_topk_idx,
+    float *out_recv_topk_weights,
+    int32_t *out_recv_src_token_idx
+) {
+    if (!out_recv_topk_idx || !out_recv_topk_weights || !out_recv_src_token_idx) {
+        return;
+    }
+    const auto *meta = reinterpret_cast<const DispatchPayloadMeta *>(
+        reinterpret_cast<const std::byte *>(x_token_src) + token_dim + token_scale_dim
+    );
+    out_recv_topk_idx[padded_token] = meta->expert_id - static_cast<int32_t>(first_expert);
+    out_recv_topk_weights[padded_token] = meta->weight;
+    out_recv_src_token_idx[padded_token] = meta->src_token_idx;
+}
+
 template<unsigned NUM_WARPS, unsigned NODE_SIZE, typename TokenDimTy, typename HiddenDimScaleTy>
 __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1)
 void a2a_dispatch_recv_kernel(
@@ -32,6 +61,9 @@ void a2a_dispatch_recv_kernel(
     float * __restrict__ out_x_scale_ptr,
     size_t out_x_scale_stride_elem,
     size_t out_x_scale_stride_token,
+    int32_t * __restrict__ out_recv_topk_idx,
+    float * __restrict__ out_recv_topk_weights,
+    int32_t * __restrict__ out_recv_src_token_idx,
     uint32_t * __restrict__ tokens_per_expert,
     std::byte * __restrict__ send_buffer,
     std::byte * __restrict__ recv_buffer,
@@ -60,6 +92,7 @@ void a2a_dispatch_recv_kernel(
         uint4 *x_token_dst;
         float *x_scale_src;
         float *x_scale_dst;
+        uint32_t dst_index;
     };
     constexpr size_t NUM_STAGES = 8;
 
@@ -75,6 +108,7 @@ void a2a_dispatch_recv_kernel(
             local_stage[i].x_scale_src = (float*)(recv_buffer + src_index * token_stride + token_dim_bound);
             local_stage[i].x_token_dst = (uint4*)(out_x_ptr + dst_index * out_x_stride);
             local_stage[i].x_scale_dst = (float*)(out_x_scale_ptr + dst_index * out_x_scale_stride_token);
+            local_stage[i].dst_index = dst_index;
         }
         __syncthreads();
     };
@@ -140,6 +174,18 @@ void a2a_dispatch_recv_kernel(
         uint4 *x_token_dst = (uint4*)(out_x_ptr + padded_token * out_x_stride);
         float *x_scale_src = (float*)((std::byte*)x_token_src + token_dim);
         float *x_scale_dst = (float*)(out_x_scale_ptr + padded_token * out_x_scale_stride_token);
+        if (threadIdx.x == 0) {
+            unpack_dispatch_payload_meta(
+                x_token_src,
+                token_dim_bound,
+                token_scale_dim,
+                first_expert,
+                padded_token,
+                out_recv_topk_idx,
+                out_recv_topk_weights,
+                out_recv_src_token_idx
+            );
+        }
         for (unsigned i = threadIdx.x; i * sizeof(uint4) < token_dim; i += blockDim.x) {
             const bool has_scale = out_x_scale_ptr && i < hidden_dim_scale_bound;
             auto val = ld_global_nc_uint4(&x_token_src[i]);
@@ -198,6 +244,20 @@ void a2a_dispatch_recv_kernel(
             uint4 *x_token_dst = local_stage[s].x_token_dst;
             float *x_scale_dst = local_stage[s].x_scale_dst;
             float *x_scale_src = local_stage[s].x_scale_src;
+            uint32_t padded_token = local_stage[s].dst_index;
+
+            if (threadIdx.x == 0) {
+                unpack_dispatch_payload_meta(
+                    x_token_src,
+                    token_dim_bound,
+                    token_scale_dim,
+                    first_expert,
+                    padded_token,
+                    out_recv_topk_idx,
+                    out_recv_topk_weights,
+                    out_recv_src_token_idx
+                );
+            }
 
             for (unsigned i = threadIdx.x; i * sizeof(uint4) < token_dim_bound; i += blockDim.x) {
                 const bool has_scale = out_x_scale_ptr && i < hidden_dim_scale_bound;
@@ -255,6 +315,9 @@ int a2a_kernels::a2a_dispatch_recv(
     uint8_t *out_x_scale_ptr,
     size_t out_x_scale_stride_elem,
     size_t out_x_scale_stride_token,
+    int32_t *out_recv_topk_idx,
+    float *out_recv_topk_weights,
+    int32_t *out_recv_src_token_idx,
     uint32_t *tokens_per_expert,
     uint8_t *send_buffer,
     uint8_t *recv_buffer,
@@ -299,6 +362,9 @@ int a2a_kernels::a2a_dispatch_recv(
         &out_x_scale_ptr,
         &out_x_scale_stride_elem,
         &out_x_scale_stride_token,
+        &out_recv_topk_idx,
+        &out_recv_topk_weights,
+        &out_recv_src_token_idx,
         &tokens_per_expert,
         &send_buffer,
         &recv_buffer,

@@ -144,6 +144,9 @@ impl PyAllToAllContext {
         out_x_scale_ptr: Option<u64>,
         out_x_scale_stride_elem: Option<usize>,
         out_x_scale_stride_token: Option<usize>,
+        out_recv_topk_idx: Option<u64>,
+        out_recv_topk_weights: Option<u64>,
+        out_recv_src_token_idx: Option<u64>,
         stream: u64,
     ) -> PyResult<()> {
         self.ctx
@@ -154,6 +157,13 @@ impl PyAllToAllContext {
                 out_x_scale_ptr.map(|ptr| ptr as *mut c_void).unwrap_or(null_mut()),
                 out_x_scale_stride_elem.unwrap_or(0),
                 out_x_scale_stride_token.unwrap_or(0),
+                out_recv_topk_idx.map(|ptr| ptr as *mut i32).unwrap_or(null_mut()),
+                out_recv_topk_weights
+                    .map(|ptr| ptr as *mut f32)
+                    .unwrap_or(null_mut()),
+                out_recv_src_token_idx
+                    .map(|ptr| ptr as *mut i32)
+                    .unwrap_or(null_mut()),
                 stream,
             )
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
@@ -164,10 +174,22 @@ impl PyAllToAllContext {
         &mut self,
         expert_x_ptr: u64,
         expert_x_stride: usize,
+        recv_src_token_idx: Option<u64>,
+        recv_topk_weights: Option<u64>,
         stream: u64,
     ) -> PyResult<()> {
         self.ctx
-            .combine_send(expert_x_ptr as *const c_void, expert_x_stride, stream)
+            .combine_send(
+                expert_x_ptr as *const c_void,
+                expert_x_stride,
+                recv_src_token_idx
+                    .map(|ptr| ptr as *const i32)
+                    .unwrap_or(null()),
+                recv_topk_weights
+                    .map(|ptr| ptr as *const f32)
+                    .unwrap_or(null()),
+                stream,
+            )
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
@@ -183,6 +205,8 @@ impl PyAllToAllContext {
         indices_stride: usize,
         weights_ptr: u64,
         weights_stride: usize,
+        recv_src_token_idx: Option<u64>,
+        recv_topk_weights: Option<u64>,
         bound_m_ptr: Option<u64>,
         accumulate: bool,
         stream: u64,
@@ -198,6 +222,12 @@ impl PyAllToAllContext {
                 indices_stride,
                 weights_ptr as *const f32,
                 weights_stride,
+                recv_src_token_idx
+                    .map(|ptr| ptr as *const i32)
+                    .unwrap_or(null()),
+                recv_topk_weights
+                    .map(|ptr| ptr as *const f32)
+                    .unwrap_or(null()),
                 bound_m_ptr.map(|ptr| ptr as *const i32).unwrap_or(null()),
                 accumulate,
                 stream,

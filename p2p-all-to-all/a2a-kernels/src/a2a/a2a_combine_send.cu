@@ -16,6 +16,31 @@
 using namespace rose;
 using namespace rose::device;
 
+struct CombinePayloadMeta {
+    int32_t src_token_idx;
+    float weight;
+    int32_t reserved0;
+    int32_t reserved1;
+};
+static_assert(sizeof(CombinePayloadMeta) == 16);
+
+__forceinline__ __device__ void store_combine_payload_meta(
+    std::byte *token_ptr,
+    size_t token_dim,
+    uint32_t source_index,
+    const int32_t *recv_src_token_idx,
+    const float *recv_topk_weights
+) {
+    if (!recv_src_token_idx || !recv_topk_weights) {
+        return;
+    }
+    auto *meta = reinterpret_cast<CombinePayloadMeta *>(token_ptr + token_dim);
+    meta->src_token_idx = recv_src_token_idx[source_index];
+    meta->weight = recv_topk_weights[source_index];
+    meta->reserved0 = 0;
+    meta->reserved1 = 0;
+}
+
 __global__ void a2a_signal_done_kernel(uint8_t * __restrict__ done) {
     if (threadIdx.x == 0) {
         fence_release_system();
@@ -27,6 +52,7 @@ __global__ void a2a_signal_done_kernel(uint8_t * __restrict__ done) {
 template <unsigned NUM_WARPS, unsigned NODE_SIZE, unsigned DP_SIZE, typename TokenDim>
 __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_combine_send_kernel(
     const size_t token_dim,
+    const size_t token_stride,
     const size_t rank,
     const std::byte * __restrict__ expert_x_ptr,
     size_t expert_x_stride,
@@ -36,6 +62,8 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_combine_send_ker
     uint32_t * __restrict__ source_rank,
     uint32_t * __restrict__ combine_send_offset,
     uint32_t * __restrict__ padded_index,
+    const int32_t * __restrict__ recv_src_token_idx,
+    const float * __restrict__ recv_topk_weights,
     const uint32_t * __restrict__ num_recv_tokens_ptr,
     uint8_t * __restrict__ combine_send_done,
     uint32_t * __restrict__ token_counter,
@@ -135,8 +163,25 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_combine_send_ker
                 auto token_rank = local_stages[s].rank;
                 auto token_node = token_rank / NODE_SIZE;
                 if (token_node != rank_node) {
-                    auto *x_token_dst = (uint4*)(send_buffer + offset * token_bound);
+                    auto *x_token_dst = (uint4*)(send_buffer + offset * token_stride);
                     st_global_nc_uint4(&x_token_dst[i], values[s]);
+                }
+            }
+        }
+        if (threadIdx.x == 0) {
+            #pragma unroll(NUM_STAGES)
+            for (unsigned s = 0; s < NUM_STAGES && token + s * gridDim.x < num_efa_tokens; s++) {
+                unsigned offset = local_stages[s].offset;
+                auto token_rank = local_stages[s].rank;
+                auto token_node = token_rank / NODE_SIZE;
+                if (token_node != rank_node) {
+                    store_combine_payload_meta(
+                        send_buffer + offset * token_stride,
+                        token_dim,
+                        local_stages[s].index,
+                        recv_src_token_idx,
+                        recv_topk_weights
+                    );
                 }
             }
         }
@@ -211,8 +256,30 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_combine_send_ker
                     #pragma unroll(DP_SIZE)
                     for (unsigned dp_peer = 0; dp_peer < DP_SIZE; dp_peer++) {
                         auto token_peer = (first_peer + dp_peer) % NODE_SIZE;
-                        auto *x_token_dst = (uint4*)(recv_ptrs_local[token_peer] + offset * token_bound);
+                        auto *x_token_dst = (uint4*)(recv_ptrs_local[token_peer] + offset * token_stride);
                         st_global_nc_uint4(&x_token_dst[i], values[s]);
+                    }
+                }
+            }
+        }
+        if (threadIdx.x == 0) {
+            #pragma unroll(NUM_STAGES)
+            for (unsigned s = 0; s < NUM_STAGES && token + s * gridDim.x < num_recv_tokens; s++) {
+                unsigned offset = local_stages[s].offset;
+                auto token_rank = local_stages[s].rank;
+                auto token_node = token_rank / NODE_SIZE;
+                if (token_node == rank_node) {
+                    unsigned first_peer = (token_rank / DP_SIZE) * DP_SIZE;
+                    #pragma unroll(DP_SIZE)
+                    for (unsigned dp_peer = 0; dp_peer < DP_SIZE; dp_peer++) {
+                        auto token_peer = (first_peer + dp_peer) % NODE_SIZE;
+                        store_combine_payload_meta(
+                            recv_ptrs_local[token_peer] + offset * token_stride,
+                            token_dim,
+                            local_stages[s].index,
+                            recv_src_token_idx,
+                            recv_topk_weights
+                        );
                     }
                 }
             }
@@ -262,6 +329,8 @@ int a2a_kernels::a2a_combine_send(
     uint32_t *source_rank,
     uint32_t *combine_send_offset,
     uint32_t *padded_index,
+    const int32_t *recv_src_token_idx,
+    const float *recv_topk_weights,
     uint32_t *num_recv_tokens_ptr,
     uint8_t *combine_send_done,
     uint32_t *token_counter,
@@ -271,9 +340,11 @@ int a2a_kernels::a2a_combine_send(
     uint64_t stream
 ) {
     const size_t token_dim = round_up<size_t>(hidden_dim * x_elemsize, sizeof(int4));
+    const size_t token_stride = token_dim + sizeof(CombinePayloadMeta);
 
     void *args[] = {
         const_cast<size_t *>(&token_dim),
+        const_cast<size_t *>(&token_stride),
         &rank,
         &expert_x_ptr,
         &expert_x_stride,
@@ -283,6 +354,8 @@ int a2a_kernels::a2a_combine_send(
         &source_rank,
         &combine_send_offset,
         &padded_index,
+        &recv_src_token_idx,
+        &recv_topk_weights,
         &num_recv_tokens_ptr,
         &combine_send_done,
         &token_counter,

@@ -20,6 +20,29 @@ struct ExpertAndOffset {
     float weight;
 };
 
+struct DispatchPayloadMeta {
+    int32_t src_token_idx;
+    int32_t topk_idx;
+    int32_t expert_id;
+    float weight;
+};
+static_assert(sizeof(DispatchPayloadMeta) == 16);
+
+__forceinline__ __device__ void store_dispatch_payload_meta(
+    std::byte *token_ptr,
+    size_t token_dim,
+    size_t token_scale_dim,
+    uint32_t token,
+    uint32_t topk_idx,
+    const ExpertAndOffset &route
+) {
+    auto *meta = reinterpret_cast<DispatchPayloadMeta *>(token_ptr + token_dim + token_scale_dim);
+    meta->src_token_idx = static_cast<int32_t>(token);
+    meta->topk_idx = static_cast<int32_t>(topk_idx);
+    meta->expert_id = static_cast<int32_t>(route.expert);
+    meta->weight = route.weight;
+}
+
 /// Wrapper class to efficiently access the expert indices and offsets.
 template<typename NumExpertsPerTokenTy>
 class ExpertIterator {
@@ -308,6 +331,9 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
                                 // Write to the private recv buffer directly using NVLink.
                                 const uint32_t local_peer = dst_rank % NODE_SIZE;
                                 std::byte *token_ptr = recv_ptrs[local_peer] + (node_group * max_private_tokens + route.offset) * token_stride;
+                                if (threadIdx.x == 0) {
+                                    store_dispatch_payload_meta(token_ptr, token_dim_bound, token_scale_dim, token, e, route);
+                                }
                                 uint4 *x_token_dst = (uint4*)token_ptr;
                                 st_global_nc_uint4(&x_token_dst[i], val);
                                 if (has_scale) {
@@ -317,6 +343,9 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
                         } else {
                             // Always write into the send buffer for local copies.
                             std::byte *token_ptr = send_buffer + route.position * token_stride;
+                            if (threadIdx.x == 0) {
+                                store_dispatch_payload_meta(token_ptr, token_dim_bound, token_scale_dim, token, e, route);
+                            }
                             uint4 *x_token_dst = (uint4*)token_ptr;
                             st_global_nc_uint4(&x_token_dst[i], val);
                             if (has_scale) {
@@ -367,6 +396,9 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
                     if (dst_node != node_rank || dst_rank == rank || route.offset >= max_private_tokens) {
                         // Always write into the send buffer for local copies.
                         std::byte *token_ptr = send_buffer + route.position * token_stride;
+                        if (threadIdx.x == 0) {
+                            store_dispatch_payload_meta(token_ptr, token_dim_bound, token_scale_dim, token, e, route);
+                        }
                         uint4 *x_token_dst = (uint4*)token_ptr;
                         for (unsigned i = threadIdx.x, s = 0; i * sizeof(uint4) < TOKEN_DIM; i += NUM_THREADS, s++) {
                             const bool has_scale = x_scale_ptr && i < hidden_dim_scale_bound;
@@ -404,6 +436,9 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
                         // Write to the private recv buffer directly using NVLink.
                         const uint32_t local_peer = dst_rank % NODE_SIZE;
                         std::byte *token_ptr = recv_ptrs[local_peer] + (node_group * max_private_tokens + route.offset) * token_stride;
+                        if (threadIdx.x == 0) {
+                            store_dispatch_payload_meta(token_ptr, token_dim_bound, token_scale_dim, token, e, route);
+                        }
                         uint4 *x_token_dst = (uint4*)token_ptr;
                         for (unsigned i = threadIdx.x, s = 0; i * sizeof(uint4) < TOKEN_DIM; i += NUM_THREADS, s++) {
                             const bool has_scale = x_scale_ptr && i < hidden_dim_scale_bound;
@@ -466,6 +501,9 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
                     } else {
                         // Always write into the send buffer for local copies.
                         std::byte *token_ptr = send_buffer + route.position * token_stride;
+                        if (threadIdx.x == 0) {
+                            store_dispatch_payload_meta(token_ptr, token_dim_bound, token_scale_dim, token, e, route);
+                        }
                         uint4 *x_token_dst = (uint4*)token_ptr;
                         st_global_nc_uint4(&x_token_dst[i], val);
                         if (has_scale) {
@@ -531,6 +569,9 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
                                 // Write to the private recv buffer directly using NVLink.
                                 const uint32_t local_peer = dst_rank % NODE_SIZE;
                                 std::byte *token_ptr = recv_ptrs[local_peer] + (node_group * max_private_tokens + route.offset) * token_stride;
+                                if (threadIdx.x == 0) {
+                                    store_dispatch_payload_meta(token_ptr, token_dim_bound, token_scale_dim, token, e, route);
+                                }
                                 uint4 *x_token_dst = (uint4*)token_ptr;
                                 st_global_nc_uint4(&x_token_dst[i], val);
                                 if (has_scale) {

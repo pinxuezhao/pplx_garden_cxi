@@ -73,12 +73,17 @@ class AllToAllContext:
         out_x_scale_ptr: int | None,
         out_x_scale_stride_elem: int | None,
         out_x_scale_stride_token: int | None,
+        out_recv_topk_idx: int | None,
+        out_recv_topk_weights: int | None,
+        out_recv_src_token_idx: int | None,
         stream: int,
     ) -> None: ...
     def combine_send(
         self,
         expert_x_ptr: int,
         expert_x_stride: int,
+        recv_src_token_idx: int | None,
+        recv_topk_weights: int | None,
         stream: int,
     ) -> None: ...
     def combine_recv(
@@ -92,6 +97,8 @@ class AllToAllContext:
         indices_stride: int,
         weights_ptr: int,
         weights_stride: int,
+        recv_src_token_idx: int | None,
+        recv_topk_weights: int | None,
         bound_m_ptr: int | None,
         accumulate: bool,
         stream: int,
